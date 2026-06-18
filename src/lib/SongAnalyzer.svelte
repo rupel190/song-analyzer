@@ -51,10 +51,9 @@
   const GAP = 10;
   const LANE_H = 46;
   const LANE_GAP = 6;
-  const FADE_HANDLE = 12;
-  const EDGE_GRAB = 9;
-  const EDGE_DELETE_PX = 28; // how far past an edge before a marker is armed for deletion
   const beatsPerBar = 4;
+  const MARKER_TAP_TOL = 12; // px tolerance for tapping a marker line
+  const DEFAULT_BLOCK_BARS = 4; // length of a block created by tapping a lane
 
   let laneIdCounter = 1;
   let blockIdCounter = 1;
@@ -81,14 +80,12 @@
   let copied = $state(false);
   let lanes = $state<Lane[]>([]);
   let plotWidth = $state(600); // shared canvas width for waveform + lanes
-  let hoverMarker = $state(false);
-  let dragging = $state(false);
-  let armedDelete = $state(false);
-  let laneArmedDelete = $state(false);
-  let lanePreview = $state<{ laneId: string; from: number; to: number } | null>(null);
   let confirmClear = $state(false);
   let editingLaneId = $state<string | null>(null);
   let editingName = $state('');
+  // Selection (tap-to-edit) — at most one of these is set at a time.
+  let selectedBlock = $state<{ laneId: string; blockId: string } | null>(null);
+  let selectedMarkerId = $state<number | null>(null);
 
   // ── Non-reactive refs ───────────────────────────────────────────────────────
   let audioCtx: AudioContext | null = null;
@@ -101,23 +98,6 @@
   let wrapEl = $state<HTMLDivElement>();
   let tapsRef: number[] = [];
 
-  type Mode = 'resizeL' | 'resizeR' | 'fadeIn' | 'fadeOut' | 'move' | 'draw';
-  interface LaneHit {
-    laneId: string;
-    blockId: string | null;
-    mode: Mode;
-    laneIndex?: number;
-  }
-  interface LaneDrag extends LaneHit {
-    startBarFloat: number;
-    orig: Block | null;
-    drawFromBar: number;
-    previewFrom?: number;
-    previewTo?: number;
-  }
-  let dragRef: { id: number } | null = null;
-  let laneDragRef: LaneDrag | null = null;
-
   // ── Derived bar helpers ──────────────────────────────────────────────────────
   const secPerBar = $derived((60 / bpm) * beatsPerBar);
   const totalBars = $derived(
@@ -128,21 +108,25 @@
   const currentBar = $derived(duration ? barAtTime(position) : 0);
   const hasBlocks = $derived(lanes.some((l) => l.blocks.length > 0));
   const showFooter = $derived(markers.length > 0 || hasBlocks);
-  const cursor = $derived(
-    laneArmedDelete
-      ? 'no-drop'
-      : dragging
-        ? armedDelete
-          ? 'no-drop'
-          : 'grabbing'
-        : hoverMarker
-          ? 'grab'
-          : activeSection
-            ? 'copy'
-            : 'crosshair'
-  );
+  const cursor = $derived(activeSection ? 'copy' : 'pointer');
 
-  // Hoisted (function declarations) so the derived values above can reference them.
+  const selectedLane = $derived.by(() => {
+    const s = selectedBlock;
+    if (!s) return null;
+    return lanes.find((l) => l.id === s.laneId) ?? null;
+  });
+  const selectedBlockData = $derived.by(() => {
+    const s = selectedBlock;
+    if (!s) return null;
+    const lane = lanes.find((l) => l.id === s.laneId);
+    return lane?.blocks.find((b) => b.id === s.blockId) ?? null;
+  });
+  const selectedMarker = $derived.by(() => {
+    const id = selectedMarkerId;
+    return id == null ? null : (markers.find((m) => m.id === id) ?? null);
+  });
+
+  // Hoisted so the derived values above can reference them.
   function barAtTime(t: number) {
     return Math.floor((t - firstBeat) / secPerBar) + 1;
   }
@@ -152,7 +136,6 @@
   function timeAtBar(bar: number) {
     return firstBeat + (bar - 1) * secPerBar;
   }
-  // Snap a fractional bar to the nearest integer bar line, clamped to the track.
   function snapBar(bar: number) {
     return Math.max(1, Math.min(totalBars + 1, Math.round(bar)));
   }
@@ -197,8 +180,7 @@
     store.write(`song:${fileKey}`, { markers, bpm, firstBeat, fileName, lanes });
   });
 
-  // Position tracking: one rAF loop for the lifetime of the component; each frame
-  // reads the *current* playing/position so it never needs to re-subscribe.
+  // Position tracking: one rAF loop for the lifetime of the component.
   $effect(() => {
     const tick = () => {
       if (playing && audioCtx) {
@@ -212,7 +194,7 @@
     return () => cancelAnimationFrame(raf);
   });
 
-  // Canvas draw — auto-tracks every reactive value it reads (no manual dep list).
+  // Canvas draw — auto-tracks every reactive value it reads.
   $effect(() => {
     draw();
   });
@@ -224,7 +206,7 @@
     if (!file) return;
     loading = true;
     fileName = file.name;
-    const key = `${file.name}_${file.size}`; // keep separate marker sets per file
+    const key = `${file.name}_${file.size}`;
     try {
       const arrayBuf = await file.arrayBuffer();
       const Ctx =
@@ -238,6 +220,7 @@
       peaks = computePeaks(buf, 2000);
       position = 0;
       startOffset = 0;
+      deselect();
       fileKey = key;
     } catch (err) {
       alert("Couldn't decode that file. Try a WAV, MP3, or M4A.");
@@ -259,7 +242,6 @@
       source = null;
     }
   }
-
   function playFrom(offset: number) {
     if (!audioCtx || !buffer) return;
     stopSource();
@@ -276,14 +258,10 @@
     startOffset = offset;
     playing = true;
   }
-
   function togglePlay() {
     if (!buffer) return;
     if (playing) {
-      if (audioCtx) {
-        const elapsed = audioCtx.currentTime - startedAt;
-        startOffset = startOffset + elapsed;
-      }
+      if (audioCtx) startOffset = startOffset + (audioCtx.currentTime - startedAt);
       stopSource();
       playing = false;
     } else {
@@ -291,248 +269,202 @@
     }
   }
 
-  // ── Canvas geometry helpers ──────────────────────────────────────────────────
+  // ── Canvas geometry ──────────────────────────────────────────────────────────
   const timeAtX = (clientX: number): number | null => {
     if (!canvasEl || !duration) return null;
     const rect = canvasEl.getBoundingClientRect();
-    const frac = clamp((clientX - rect.left) / rect.width, 0, 1);
-    return frac * duration;
+    return clamp((clientX - rect.left) / rect.width, 0, 1) * duration;
   };
-
   function seekTo(t: number) {
     position = t;
     if (playing) playFrom(t);
     else startOffset = t;
   }
-
-  function localPt(e: PointerEvent) {
-    const rect = canvasEl!.getBoundingClientRect();
-    return { px: e.clientX - rect.left, py: e.clientY - rect.top };
-  }
-
   const laneTimeToX = (t: number) => (duration ? (t / duration) * plotWidth : 0);
-  const laneXToTime = (x: number) => (duration ? (x / plotWidth) * duration : 0);
-  const laneXToBarFloat = (x: number) => barFloatAtTime(laneXToTime(x));
+  const laneXToBarFloat = (x: number) => barFloatAtTime((duration ? (x / plotWidth) * duration : 0));
 
-  // Hit-test a marker for grabbing — only the flag label (top band) grabs it.
-  function markerAtX(clientX: number, clientY: number | null): Marker | null {
-    if (!canvasEl || !duration) return null;
-    const rect = canvasEl.getBoundingClientRect();
-    const px = clientX - rect.left;
-    const py = clientY == null ? null : clientY - rect.top;
-    const ctx = canvasEl.getContext('2d');
-    if (!ctx) return null;
-    ctx.font = '11px ui-sans-serif, system-ui';
-    if (py == null || py < 0 || py > 18) return null;
-    for (const m of markers) {
-      const mx = (m.t / duration) * rect.width;
-      const flagW = ctx.measureText(m.name).width + 10;
-      if (px >= mx - 2 && px <= mx + flagW + 2) return m;
-    }
-    return null;
-  }
-
-  // Which lane index does a y fall in (below the waveform band + gap)? -1 if none.
   function laneIndexAtY(py: number): number {
     const base = WAVE_H + GAP;
     if (py < base) return -1;
     const li = Math.floor((py - base) / (LANE_H + LANE_GAP));
     return li >= 0 && li < lanes.length ? li : -1;
   }
-
-  // Hit-test a block within a lane. Four independent corners:
-  //   bottom-left → resizeL (start), bottom-right → resizeR (end)
-  //   top-left → fadeIn apex,        top-right → fadeOut apex
-  function laneHitTest(px: number, py: number): LaneHit | null {
-    const li = laneIndexAtY(py);
-    if (li < 0) return null;
+  function blockAt(px: number, li: number): { laneId: string; blockId: string } | null {
     const lane = lanes[li];
-    const top = WAVE_H + GAP + li * (LANE_H + LANE_GAP);
-    const innerTop = top + 6;
-    const bot = top + LANE_H - 6;
+    if (!lane) return null;
     for (const bl of lane.blocks) {
       const x1 = laneTimeToX(timeAtBar(bl.startBar));
       const x2 = laneTimeToX(timeAtBar(bl.endBar));
-      if (px < x1 - EDGE_GRAB || px > x2 + EDGE_GRAB) continue;
-      const xIn = laneTimeToX(timeAtBar(bl.startBar + bl.fadeInBars));
-      const xOut = laneTimeToX(timeAtBar(bl.endBar - bl.fadeOutBars));
-      const nearTop = Math.abs(py - innerTop) < FADE_HANDLE;
-      const nearBot = Math.abs(py - bot) < FADE_HANDLE;
-      // top corners → drag a fade apex
-      if (nearTop) {
-        if (Math.abs(px - xIn) < FADE_HANDLE) return { laneId: lane.id, blockId: bl.id, mode: 'fadeIn' };
-        if (Math.abs(px - xOut) < FADE_HANDLE) return { laneId: lane.id, blockId: bl.id, mode: 'fadeOut' };
-      }
-      // bottom corners → resize the time edges
-      if (nearBot) {
-        if (Math.abs(px - x1) < FADE_HANDLE) return { laneId: lane.id, blockId: bl.id, mode: 'resizeL' };
-        if (Math.abs(px - x2) < FADE_HANDLE) return { laneId: lane.id, blockId: bl.id, mode: 'resizeR' };
-      }
-      // either vertical edge anywhere → resize
-      if (Math.abs(px - x1) < EDGE_GRAB) return { laneId: lane.id, blockId: bl.id, mode: 'resizeL' };
-      if (Math.abs(px - x2) < EDGE_GRAB) return { laneId: lane.id, blockId: bl.id, mode: 'resizeR' };
-      if (px >= x1 && px <= x2) return { laneId: lane.id, blockId: bl.id, mode: 'move' };
+      if (px >= x1 - 4 && px <= x2 + 4) return { laneId: lane.id, blockId: bl.id };
     }
-    return { laneId: lane.id, blockId: null, mode: 'draw', laneIndex: li };
+    return null;
+  }
+  function markerAt(px: number, py: number): number | null {
+    if (!duration || py < 0 || py > WAVE_H) return null;
+    let best: number | null = null;
+    let bestDist = MARKER_TAP_TOL;
+    for (const m of markers) {
+      const d = Math.abs(px - (m.t / duration) * plotWidth);
+      if (d < bestDist) {
+        bestDist = d;
+        best = m.id;
+      }
+    }
+    return best;
   }
 
-  // ── Pointer handlers ───────────────────────────────────────────────────────────
-  function handlePointerDown(e: PointerEvent) {
+  // ── Tap handling (everything is a tap; drags scroll the page) ──────────────────
+  function handleCanvasClick(e: MouseEvent) {
     if (!duration || !canvasEl) return;
-    const { px, py } = localPt(e);
-    // ── lane region ──
+    const rect = canvasEl.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+
+    // ── lane region: blocks ──
     if (peaks && py >= WAVE_H + GAP) {
-      const hit = laneHitTest(px, py);
-      if (!hit) return;
-      const lane = lanes.find((l) => l.id === hit.laneId);
-      const bl = hit.blockId && lane ? lane.blocks.find((b) => b.id === hit.blockId) : null;
-      laneDragRef = {
-        ...hit,
-        startBarFloat: laneXToBarFloat(px),
-        orig: bl ? { ...bl } : null,
-        drawFromBar: snapBar(laneXToBarFloat(px)),
-      };
-      laneArmedDelete = false;
-      canvasEl.setPointerCapture(e.pointerId);
+      const li = laneIndexAtY(py);
+      if (li < 0) {
+        deselect();
+        return;
+      }
+      const hit = blockAt(px, li);
+      if (hit) {
+        selectBlock(hit.laneId, hit.blockId);
+      } else if (selectedBlock || selectedMarkerId != null) {
+        deselect(); // tap out of a selection applies + exits
+      } else {
+        createBlockAt(li, px);
+      }
       return;
     }
-    // ── waveform / marker region ──
-    const hit = markerAtX(e.clientX, e.clientY);
-    if (hit) {
-      dragRef = { id: hit.id };
-      dragging = true;
-      armedDelete = false;
-      canvasEl.setPointerCapture(e.pointerId);
+
+    // ── waveform region: markers + seek ──
+    const mk = markerAt(px, py);
+    if (selectedMarkerId != null) {
+      if (mk != null) {
+        selectMarker(mk); // switch to another marker
+      } else {
+        const t = timeAtX(e.clientX);
+        if (t != null) moveMarkerTo(selectedMarkerId, t); // move the selected one here
+      }
+      return;
+    }
+    if (mk != null) {
+      selectMarker(mk);
       return;
     }
     const t = timeAtX(e.clientX);
     if (t == null) return;
     if (activeSection) {
-      addMarker(t, activeSection);
+      const id = addMarker(t, activeSection);
+      activeSection = null; // exit place-mode so the new marker is editable
+      selectMarker(id); // auto-select it
       seekTo(t);
     } else {
+      deselect();
       seekTo(t);
     }
   }
 
-  function handlePointerMove(e: PointerEvent) {
-    // ── lane drag in progress ──
-    const ld = laneDragRef;
-    if (ld) {
-      const { px, py } = localPt(e);
-      const barF = laneXToBarFloat(px);
-      if (ld.mode === 'draw') {
-        const fromBar = ld.drawFromBar;
-        const toBar = snapBar(barF);
-        ld.previewFrom = Math.min(fromBar, toBar);
-        ld.previewTo = Math.max(fromBar, toBar);
-        lanePreview = { laneId: ld.laneId, from: ld.previewFrom, to: ld.previewTo };
-        return;
-      }
-      // only a whole-block move can be thrown out to delete
-      if (ld.mode === 'move') {
-        const offEdge =
-          px > plotWidth + 28 ||
-          py < WAVE_H + GAP - 28 ||
-          py > WAVE_H + GAP + lanes.length * (LANE_H + LANE_GAP) + 28;
-        if (laneArmedDelete !== offEdge) laneArmedDelete = offEdge;
-      }
-      const orig = ld.orig;
-      if (!orig) return;
-      const span = orig.endBar - orig.startBar;
-      const deltaBars = barF - ld.startBarFloat;
-      if (ld.mode === 'move') {
-        const len = span;
-        const ns = clamp(snapBar(orig.startBar + deltaBars), 1, totalBars + 1 - len);
-        // whole-block move keeps fades relative (corners travel together)
-        patchBlock(ld.laneId, ld.blockId!, { startBar: ns, endBar: ns + len });
-      } else if (ld.mode === 'resizeL') {
-        // bottom-left → start; hold the fade-in apex at its absolute bar
-        const ns = clamp(snapBar(orig.startBar + deltaBars), 1, orig.endBar - 1);
-        const apexInAbs = orig.startBar + orig.fadeInBars;
-        const fadeIn = clamp(apexInAbs - ns, 0, orig.endBar - ns - orig.fadeOutBars);
-        patchBlock(ld.laneId, ld.blockId!, { startBar: ns, fadeInBars: fadeIn });
-      } else if (ld.mode === 'resizeR') {
-        // bottom-right → end; hold the fade-out apex at its absolute bar
-        const ne = clamp(snapBar(orig.endBar + deltaBars), orig.startBar + 1, totalBars + 1);
-        const apexOutAbs = orig.endBar - orig.fadeOutBars;
-        const fadeOut = clamp(ne - apexOutAbs, 0, ne - orig.startBar - orig.fadeInBars);
-        patchBlock(ld.laneId, ld.blockId!, { endBar: ne, fadeOutBars: fadeOut });
-      } else if (ld.mode === 'fadeIn') {
-        // top-left → fade-in apex only; cannot cross the fade-out apex
-        const apexBar = Math.round(barF);
-        const fadeIn = clamp(apexBar - orig.startBar, 0, span - orig.fadeOutBars);
-        patchBlock(ld.laneId, ld.blockId!, { fadeInBars: fadeIn });
-      } else if (ld.mode === 'fadeOut') {
-        // top-right → fade-out apex only; cannot cross the fade-in apex
-        const apexBar = Math.round(barF);
-        const fadeOut = clamp(orig.endBar - apexBar, 0, span - orig.fadeInBars);
-        patchBlock(ld.laneId, ld.blockId!, { fadeOutBars: fadeOut });
-      }
-      return;
-    }
-    // ── marker drag / hover ──
-    if (dragRef) {
-      if (!canvasEl) return;
-      const rect = canvasEl.getBoundingClientRect();
-      const px = e.clientX - rect.left;
-      const offEdge = px > rect.width + EDGE_DELETE_PX || px < -EDGE_DELETE_PX;
-      if (armedDelete !== offEdge) armedDelete = offEdge;
-      const t = timeAtX(e.clientX);
-      if (t == null) return;
-      const id = dragRef.id;
-      markers = markers.map((m) => (m.id === id ? { ...m, t } : m));
-      return;
-    }
-    const over = !!markerAtX(e.clientX, e.clientY);
-    if (hoverMarker !== over) hoverMarker = over;
+  function selectBlock(laneId: string, blockId: string) {
+    selectedBlock = { laneId, blockId };
+    selectedMarkerId = null;
+  }
+  function selectMarker(id: number) {
+    selectedMarkerId = id;
+    selectedBlock = null;
+  }
+  function deselect() {
+    selectedBlock = null;
+    selectedMarkerId = null;
   }
 
-  function handlePointerUp(e: PointerEvent) {
-    const ld = laneDragRef;
-    if (ld) {
-      if (ld.mode === 'draw' && ld.previewFrom != null && ld.previewTo != null) {
-        if (ld.previewTo - ld.previewFrom >= 1) addBlock(ld.laneId, ld.previewFrom, ld.previewTo);
-      } else if (laneArmedDelete && ld.blockId) {
-        deleteBlock(ld.laneId, ld.blockId);
-      }
-      laneDragRef = null;
-      laneArmedDelete = false;
-      lanePreview = null;
-      canvasEl?.releasePointerCapture(e.pointerId);
-      return;
-    }
-    if (dragRef) {
-      const id = dragRef.id;
-      if (armedDelete) {
-        markers = markers.filter((m) => m.id !== id);
-      } else {
-        markers = [...markers].sort((a, b) => a.t - b.t);
-      }
-      dragRef = null;
-      dragging = false;
-      armedDelete = false;
-      canvasEl?.releasePointerCapture(e.pointerId);
-    }
+  function createBlockAt(laneIndex: number, px: number) {
+    const lane = lanes[laneIndex];
+    if (!lane || totalBars < 1) return;
+    const startBar = clamp(snapBar(laneXToBarFloat(px)), 1, totalBars);
+    const endBar = Math.min(totalBars + 1, startBar + DEFAULT_BLOCK_BARS);
+    if (endBar - startBar < 1) return;
+    const block: Block = {
+      id: `blk_${blockIdCounter++}_${Date.now()}`,
+      startBar,
+      endBar,
+      fadeInBars: 0,
+      fadeOutBars: 0,
+    };
+    lanes = lanes.map((l) =>
+      l.id === lane.id ? { ...l, blocks: [...l.blocks, block].sort((x, y) => x.startBar - y.startBar) } : l
+    );
+    selectBlock(lane.id, block.id);
   }
 
-  function handlePointerLeave() {
-    if (!dragRef) hoverMarker = false;
+  // ── Block steppers (each adjusts one field by ±1 bar, clamped) ─────────────────
+  function stepStart(d: number) {
+    const s = selectedBlock;
+    const b = selectedBlockData;
+    if (!s || !b) return;
+    const newStart = clamp(b.startBar + d, 1, b.endBar - 1);
+    const apexInAbs = b.startBar + b.fadeInBars; // hold the fade-in apex in place
+    const fadeIn = clamp(apexInAbs - newStart, 0, b.endBar - newStart - b.fadeOutBars);
+    patchBlock(s.laneId, s.blockId, { startBar: newStart, fadeInBars: fadeIn });
+  }
+  function stepEnd(d: number) {
+    const s = selectedBlock;
+    const b = selectedBlockData;
+    if (!s || !b) return;
+    const newEnd = clamp(b.endBar + d, b.startBar + 1, totalBars + 1);
+    const apexOutAbs = b.endBar - b.fadeOutBars; // hold the fade-out apex in place
+    const fadeOut = clamp(newEnd - apexOutAbs, 0, newEnd - b.startBar - b.fadeInBars);
+    patchBlock(s.laneId, s.blockId, { endBar: newEnd, fadeOutBars: fadeOut });
+  }
+  function stepFadeIn(d: number) {
+    const s = selectedBlock;
+    const b = selectedBlockData;
+    if (!s || !b) return;
+    patchBlock(s.laneId, s.blockId, {
+      fadeInBars: clamp(b.fadeInBars + d, 0, b.endBar - b.startBar - b.fadeOutBars),
+    });
+  }
+  function stepFadeOut(d: number) {
+    const s = selectedBlock;
+    const b = selectedBlockData;
+    if (!s || !b) return;
+    patchBlock(s.laneId, s.blockId, {
+      fadeOutBars: clamp(b.fadeOutBars + d, 0, b.endBar - b.startBar - b.fadeInBars),
+    });
+  }
+  function deleteSelectedBlock() {
+    const s = selectedBlock;
+    if (!s) return;
+    deleteBlock(s.laneId, s.blockId);
+    selectedBlock = null;
   }
 
   // ── Markers ──────────────────────────────────────────────────────────────────
-  function addMarker(atTime: number, section: Section) {
-    const m: Marker = { id: Date.now() + Math.random(), t: atTime, name: section.name, color: section.color };
-    markers = [...markers, m].sort((a, b) => a.t - b.t);
+  function addMarker(atTime: number, section: Section): number {
+    const id = Date.now() + Math.random();
+    markers = [...markers, { id, t: atTime, name: section.name, color: section.color }].sort(
+      (a, b) => a.t - b.t
+    );
+    return id;
   }
-
+  function moveMarkerTo(id: number, t: number) {
+    markers = markers
+      .map((m) => (m.id === id ? { ...m, t: clamp(t, 0, duration) } : m))
+      .sort((a, b) => a.t - b.t);
+  }
+  function nudgeMarker(d: number) {
+    const m = selectedMarker;
+    if (m) moveMarkerTo(m.id, m.t + d);
+  }
   function renameMarker(id: number) {
     const m = markers.find((x) => x.id === id);
     const name = window.prompt('Marker name', m?.name || '');
     if (name != null) markers = markers.map((x) => (x.id === id ? { ...x, name } : x));
   }
-
-  const deleteMarker = (id: number) => (markers = markers.filter((x) => x.id !== id));
+  function deleteMarker(id: number) {
+    markers = markers.filter((x) => x.id !== id);
+  }
   const jumpTo = (t: number) => seekTo(t);
 
   // ── TSV export ─────────────────────────────────────────────────────────────────
@@ -575,21 +507,14 @@
   function updateLaneBlocks(laneId: string, updater: (blocks: Block[]) => Block[]) {
     lanes = lanes.map((l) => (l.id === laneId ? { ...l, blocks: updater(l.blocks) } : l));
   }
-  function addBlock(laneId: string, startBar: number, endBar: number) {
-    const a = Math.min(startBar, endBar);
-    const b = Math.max(startBar, endBar);
-    if (b - a < 1) return;
-    const block: Block = { id: `blk_${blockIdCounter++}_${Date.now()}`, startBar: a, endBar: b, fadeInBars: 0, fadeOutBars: 0 };
-    updateLaneBlocks(laneId, (blocks) => [...blocks, block].sort((x, y) => x.startBar - y.startBar));
-  }
   function patchBlock(laneId: string, blockId: string, patch: Partial<Block>) {
     updateLaneBlocks(laneId, (blocks) => blocks.map((bl) => (bl.id === blockId ? { ...bl, ...patch } : bl)));
   }
   function deleteBlock(laneId: string, blockId: string) {
     updateLaneBlocks(laneId, (blocks) => blocks.filter((bl) => bl.id !== blockId));
   }
-  // Inline lane-name editing (replaces window.prompt — works on touch, and lets a
-  // freshly-added lane be named immediately).
+
+  // Inline lane-name editing (touch-friendly; new lanes open for naming at once).
   function startEditLane(l: Lane) {
     editingLaneId = l.id;
     editingName = l.name;
@@ -605,22 +530,23 @@
     node.focus();
     node.select();
   }
-  const removeLane = (laneId: string) => (lanes = lanes.filter((x) => x.id !== laneId));
+  function removeLane(laneId: string) {
+    if (selectedBlock?.laneId === laneId) selectedBlock = null;
+    lanes = lanes.filter((x) => x.id !== laneId);
+  }
   function addLane() {
     const palette = ['#c45b5b', '#d4915d', '#9a7bb8', '#4a8fb8', '#7b9e7e', '#8f8f6b', '#b8709e', '#5fb0a8'];
     const color = palette[lanes.length % palette.length];
     const lane = makeLane(`Lane ${lanes.length + 1}`, color);
     lanes = [...lanes, lane];
-    startEditLane(lane); // open the name for editing right away
+    startEditLane(lane);
   }
 
   // ── BPM / grid controls ──────────────────────────────────────────────────────
   function onBpmInput(e: Event) {
-    const v = +(e.target as HTMLInputElement).value || 0;
-    bpm = Math.min(300, Math.max(40, v));
+    bpm = Math.min(300, Math.max(40, +(e.target as HTMLInputElement).value || 0));
   }
   const nudgeFirstBeat = (d: number) => (firstBeat = Math.max(0, +(firstBeat + d).toFixed(3)));
-
   function tapTempo() {
     const now = performance.now();
     const taps = tapsRef.filter((t) => now - t < 2500);
@@ -634,11 +560,11 @@
       if (detected >= 40 && detected <= 300) bpm = detected;
     }
   }
-
   function clearAll() {
     if (confirmClear) {
       markers = [];
       lanes = lanes.map((l) => ({ ...l, blocks: [] }));
+      deselect();
       confirmClear = false;
     } else {
       confirmClear = true;
@@ -665,7 +591,7 @@
     ctx.clearRect(0, 0, cssW, cssH);
     const tx = (t: number) => (duration ? (t / duration) * cssW : 0);
 
-    // ── waveform box ──
+    // waveform box
     ctx.fillStyle = '#16151a';
     ctx.fillRect(0, 0, cssW, WAVE_H);
     const mid = WAVE_H / 2;
@@ -675,24 +601,21 @@
       for (let i = 0; i < n; i++) {
         const x = (i / n) * cssW;
         const [mn, mx] = peaks[i];
-        const y1 = mid - mx * (mid - 8);
-        const y2 = mid - mn * (mid - 8);
-        ctx.fillRect(x, y1, Math.max(1, cssW / n), Math.max(1, y2 - y1));
+        ctx.fillRect(x, mid - mx * (mid - 8), Math.max(1, cssW / n), Math.max(1, (mx - mn) * (mid - 8)));
       }
     }
 
-    // ── arrangement box ──
+    // arrangement box + lane rows
     if (peaks) {
       ctx.fillStyle = '#0f0e14';
       ctx.fillRect(0, laneTop0, cssW, lanesH);
       lanes.forEach((_lane, li) => {
-        const top = laneTop0 + li * (LANE_H + LANE_GAP);
         ctx.fillStyle = '#15141b';
-        ctx.fillRect(0, top, cssW, LANE_H);
+        ctx.fillRect(0, laneTop0 + li * (LANE_H + LANE_GAP), cssW, LANE_H);
       });
     }
 
-    // ── bar grid ──
+    // bar grid
     if (showGrid && duration && secPerBar > 0) {
       let bar = 1;
       for (let t = firstBeat; t < duration; t += secPerBar) {
@@ -719,9 +642,9 @@
       }
     }
 
-    // ── arrangement blocks + lane labels ──
+    // arrangement blocks + lane labels
     if (peaks) {
-      const blkDrag = laneDragRef;
+      const sel = selectedBlock;
       lanes.forEach((lane, li) => {
         const top = laneTop0 + li * (LANE_H + LANE_GAP);
         const innerTop = top + 6;
@@ -731,46 +654,36 @@
           const x2 = tx(timeAtBar(bl.endBar));
           const xIn = tx(timeAtBar(bl.startBar + bl.fadeInBars));
           const xOut = tx(timeAtBar(bl.endBar - bl.fadeOutBars));
-          const bw = x2 - x1;
-          const isArmed = laneArmedDelete && blkDrag && blkDrag.laneId === lane.id && blkDrag.blockId === bl.id;
-
+          const isSel = !!sel && sel.laneId === lane.id && sel.blockId === bl.id;
           ctx.save();
           ctx.beginPath();
-          ctx.moveTo(x1, bot); // bottom-left
-          ctx.lineTo(xIn, innerTop); // up the fade-in ramp
-          ctx.lineTo(xOut, innerTop); // across the top
-          ctx.lineTo(x2, bot); // down the fade-out ramp
+          ctx.moveTo(x1, bot);
+          ctx.lineTo(xIn, innerTop);
+          ctx.lineTo(xOut, innerTop);
+          ctx.lineTo(x2, bot);
           ctx.closePath();
-          ctx.fillStyle = isArmed ? '#c45b5b' : lane.color;
-          ctx.globalAlpha = isArmed ? 0.3 : 0.85;
+          ctx.fillStyle = lane.color;
+          ctx.globalAlpha = isSel ? 0.95 : 0.8;
           ctx.fill();
           ctx.globalAlpha = 1;
-          ctx.strokeStyle = isArmed ? '#c45b5b' : lighten(lane.color);
-          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = isSel ? '#f0e9d8' : lighten(lane.color);
+          ctx.lineWidth = isSel ? 2.5 : 1.5;
           ctx.stroke();
-          if (bw > 24) {
-            // bottom corners = resize grips (start / end)
-            ctx.fillStyle = 'rgba(240,233,216,0.92)';
-            ctx.fillRect(x1 - 3, bot - 3, 6, 6);
-            ctx.fillRect(x2 - 3, bot - 3, 6, 6);
-            // top corners = fade apex grips
-            ctx.fillStyle = 'rgba(212,145,93,0.95)';
-            ctx.fillRect(xIn - 3, innerTop - 3, 6, 6);
-            ctx.fillRect(xOut - 3, innerTop - 3, 6, 6);
+          if (isSel) {
+            ctx.fillStyle = '#f0e9d8';
+            for (const [hx, hy] of [
+              [x1, bot],
+              [x2, bot],
+              [xIn, innerTop],
+              [xOut, innerTop],
+            ] as [number, number][]) {
+              ctx.beginPath();
+              ctx.arc(hx, hy, 3.5, 0, Math.PI * 2);
+              ctx.fill();
+            }
           }
           ctx.restore();
         });
-
-        if (lanePreview && lanePreview.laneId === lane.id) {
-          const px1 = tx(timeAtBar(lanePreview.from));
-          const px2 = tx(timeAtBar(lanePreview.to));
-          ctx.save();
-          ctx.globalAlpha = 0.5;
-          ctx.fillStyle = lane.color;
-          ctx.fillRect(px1, top + 6, Math.max(2, px2 - px1), LANE_H - 12);
-          ctx.restore();
-        }
-
         // lane label
         ctx.save();
         ctx.font = '600 10px ui-sans-serif, system-ui';
@@ -785,15 +698,13 @@
       });
     }
 
-    // ── markers ──
-    const draggingId = dragRef?.id;
+    // markers
     markers.forEach((m) => {
-      const x = (m.t / duration) * cssW;
-      const isArmed = armedDelete && m.id === draggingId;
+      const x = tx(m.t);
+      const isSel = m.id === selectedMarkerId;
       ctx.save();
-      if (isArmed) ctx.globalAlpha = 0.3;
-      ctx.strokeStyle = isArmed ? '#c45b5b' : m.color;
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = isSel ? '#f0e9d8' : m.color;
+      ctx.lineWidth = isSel ? 3 : 2;
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, WAVE_H);
@@ -804,17 +715,21 @@
         ctx.lineTo(x, cssH);
         ctx.stroke();
       }
-      ctx.fillStyle = isArmed ? '#c45b5b' : m.color;
-      const label = isArmed ? 'release to delete' : m.name;
       ctx.font = '11px ui-sans-serif, system-ui';
-      const w = ctx.measureText(label).width + 10;
+      const w = ctx.measureText(m.name).width + 10;
+      ctx.fillStyle = m.color;
       ctx.fillRect(x, 0, w, 16);
-      ctx.fillStyle = isArmed ? '#fff' : '#0d0c10';
-      ctx.fillText(label, x + 5, 12);
+      ctx.fillStyle = '#0d0c10';
+      ctx.fillText(m.name, x + 5, 12);
+      if (isSel) {
+        ctx.strokeStyle = '#f0e9d8';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x + 0.5, 0.5, w, 16);
+      }
       ctx.restore();
     });
 
-    // ── playhead ──
+    // playhead
     if (duration) {
       const px = (position / duration) * cssW;
       ctx.strokeStyle = '#f0e9d8';
@@ -885,14 +800,8 @@
     <button class="toggle" class:on={showGrid} onclick={() => (showGrid = !showGrid)}>
       Grid {showGrid ? 'on' : 'off'}
     </button>
-    <button
-      class="alignBtn"
-      onclick={() => (firstBeat = +position.toFixed(3))}
-      disabled={!peaks}
-      title="Set the current playhead as the downbeat of bar 1"
-    >
-      Set bar 1 = playhead
-    </button>
+    <button class="alignBtn" onclick={() => (firstBeat = +position.toFixed(3))} disabled={!peaks}
+      title="Set the current playhead as the downbeat of bar 1">Set bar 1 = playhead</button>
   </div>
 
   <!-- Section palette -->
@@ -913,19 +822,70 @@
 
   <!-- Waveform + arrangement canvas -->
   <div class="canvasWrap" bind:this={wrapEl}>
-    <canvas
-      bind:this={canvasEl}
-      class="canvas"
-      style="cursor:{cursor}"
-      onpointerdown={handlePointerDown}
-      onpointermove={handlePointerMove}
-      onpointerup={handlePointerUp}
-      onpointerleave={handlePointerLeave}
-    ></canvas>
+    <canvas bind:this={canvasEl} class="canvas" style="cursor:{cursor}" onclick={handleCanvasClick}></canvas>
     {#if !peaks}
       <div class="placeholder">{loading ? 'Reading waveform…' : 'Waveform appears here'}</div>
     {/if}
   </div>
+
+  <!-- Edit strip for the currently selected block / marker -->
+  {#if selectedBlockData && selectedLane}
+    <div class="editStrip">
+      <div class="editHead">
+        <span class="laneDot" style="background:{selectedLane.color}"></span>
+        <strong class="editName">{selectedLane.name}</strong>
+        <span class="editSub">bars {selectedBlockData.startBar}–{selectedBlockData.endBar}</span>
+        <button class="editDel" onclick={deleteSelectedBlock}>Delete</button>
+        <button class="editDone" onclick={deselect}>Done</button>
+      </div>
+      <div class="stepGrid">
+        <div class="stepCtl">
+          <span class="stepLbl">Start</span>
+          <button class="bigStep" onclick={() => stepStart(-1)}>−</button>
+          <span class="stepVal">{selectedBlockData.startBar}</span>
+          <button class="bigStep" onclick={() => stepStart(1)}>+</button>
+        </div>
+        <div class="stepCtl">
+          <span class="stepLbl">End</span>
+          <button class="bigStep" onclick={() => stepEnd(-1)}>−</button>
+          <span class="stepVal">{selectedBlockData.endBar}</span>
+          <button class="bigStep" onclick={() => stepEnd(1)}>+</button>
+        </div>
+        <div class="stepCtl">
+          <span class="stepLbl">Fade in</span>
+          <button class="bigStep" onclick={() => stepFadeIn(-1)}>−</button>
+          <span class="stepVal">{selectedBlockData.fadeInBars}</span>
+          <button class="bigStep" onclick={() => stepFadeIn(1)}>+</button>
+        </div>
+        <div class="stepCtl">
+          <span class="stepLbl">Fade out</span>
+          <button class="bigStep" onclick={() => stepFadeOut(-1)}>−</button>
+          <span class="stepVal">{selectedBlockData.fadeOutBars}</span>
+          <button class="bigStep" onclick={() => stepFadeOut(1)}>+</button>
+        </div>
+      </div>
+    </div>
+  {:else if selectedMarker}
+    <div class="editStrip">
+      <div class="editHead">
+        <span class="laneDot" style="background:{selectedMarker.color}"></span>
+        <strong class="editName">{selectedMarker.name}</strong>
+        <span class="editSub">{fmtTime(selectedMarker.t)} · bar {barAtTime(selectedMarker.t)}</span>
+        <button class="editDel" onclick={() => { if (selectedMarkerId != null) deleteMarker(selectedMarkerId); deselect(); }}>Delete</button>
+        <button class="editDone" onclick={deselect}>Done</button>
+      </div>
+      <div class="stepGrid">
+        <div class="stepCtl">
+          <span class="stepLbl">Move</span>
+          <button class="bigStep" onclick={() => nudgeMarker(-0.1)}>◀</button>
+          <span class="stepVal">{selectedMarker.t.toFixed(2)}s</span>
+          <button class="bigStep" onclick={() => nudgeMarker(0.1)}>▶</button>
+        </div>
+        <button class="editRename" onclick={() => { if (selectedMarkerId != null) renameMarker(selectedMarkerId); }}>Rename</button>
+      </div>
+      <div class="editHint">Tip: tap the waveform to move this marker there.</div>
+    </div>
+  {/if}
 
   <!-- Arrangement lane controls -->
   {#if peaks}
@@ -956,6 +916,7 @@
         </div>
       {/each}
     </div>
+    <div class="hint">Tap an empty lane to add a block · tap a block to edit it.</div>
   {/if}
 
   <!-- Marker list -->
@@ -974,8 +935,8 @@
             <strong style="color:#e8e4da">{m.name}</strong>
             <span class="itemTime">{fmtTime(m.t)} · bar {barAtTime(m.t)}</span>
           </button>
-          <button class="iconBtn" onclick={() => renameMarker(m.id)} title="Rename">✎</button>
-          <button class="iconBtn" onclick={() => deleteMarker(m.id)} title="Delete">✕</button>
+          <button class="iconBtn" onclick={() => selectMarker(m.id)} title="Edit">✎</button>
+          <button class="iconBtn" onclick={() => { deleteMarker(m.id); if (selectedMarkerId === m.id) deselect(); }} title="Delete">✕</button>
         </li>
       {/each}
     </ul>
@@ -1178,7 +1139,7 @@
   .canvas {
     display: block;
     width: 100%;
-    touch-action: none;
+    touch-action: manipulation;
   }
   .placeholder {
     position: absolute;
@@ -1192,17 +1153,6 @@
     pointer-events: none;
   }
 
-  .playBtn {
-    width: 44px;
-    height: 44px;
-    border-radius: 50%;
-    border: 1px solid #3a3850;
-    background: #1c1b22;
-    color: #e8e4da;
-    font-size: 15px;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
   .timeReadout {
     display: flex;
     align-items: baseline;
@@ -1221,6 +1171,113 @@
     font-family: var(--mono);
     font-size: 13px;
     color: #a8a3bd;
+  }
+  .playBtn {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 1px solid #3a3850;
+    background: #1c1b22;
+    color: #e8e4da;
+    font-size: 15px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  /* Edit strip (selected block / marker) */
+  .editStrip {
+    margin-top: 12px;
+    padding: 12px;
+    background: #131218;
+    border: 1px solid #2a2740;
+    border-radius: 10px;
+  }
+  .editHead {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  .editName {
+    color: #e8e4da;
+    font-size: 14px;
+  }
+  .editSub {
+    color: #8e89a3;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .editDel {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid #3a2828;
+    color: #a86b6b;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .editDone {
+    background: #1c1b22;
+    border: 1px solid #3a3850;
+    color: #4a8fb8;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .stepGrid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    align-items: center;
+  }
+  .stepCtl {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .stepLbl {
+    font-size: 10px;
+    font-family: var(--mono);
+    letter-spacing: 0.08em;
+    color: #8e89a3;
+    text-transform: uppercase;
+    min-width: 52px;
+  }
+  .bigStep {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    border: 1px solid #3a3850;
+    background: #1c1b22;
+    color: #e8e4da;
+    font-size: 20px;
+    cursor: pointer;
+  }
+  .stepVal {
+    min-width: 46px;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 15px;
+    color: #e8e4da;
+  }
+  .editRename {
+    background: #1c1b22;
+    border: 1px solid #3a3850;
+    color: #cfcad9;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .editHint {
+    margin-top: 8px;
+    font-size: 11px;
+    color: #6a6780;
+    font-family: var(--mono);
   }
 
   .listHead {
@@ -1252,11 +1309,18 @@
     text-transform: none;
     letter-spacing: 0;
   }
+  .hint {
+    font-size: 11px;
+    color: #6a6780;
+    font-family: var(--mono);
+    margin-top: 8px;
+  }
 
   .laneChips {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+    margin-top: 8px;
   }
   .laneChip {
     display: flex;
@@ -1271,6 +1335,7 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
+    flex-shrink: 0;
   }
   .laneName {
     background: none;
@@ -1297,32 +1362,6 @@
     font-size: 13px;
     cursor: pointer;
     padding: 0 2px;
-  }
-
-  .exportBtn {
-    background: #1c1b22;
-    border: 1px solid #3a3850;
-    color: #4a8fb8;
-    border-radius: 7px;
-    padding: 8px 16px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .clearAll {
-    background: transparent;
-    border: 1px solid #3a2828;
-    color: #a86b6b;
-    border-radius: 7px;
-    padding: 8px 14px;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .clearAll.armed {
-    background: #c45b5b;
-    border: 1px solid #c45b5b;
-    color: #0d0c10;
-    font-weight: 600;
   }
 
   .empty {
@@ -1366,14 +1405,39 @@
     font-family: var(--mono);
   }
   .iconBtn {
-    width: 30px;
-    height: 30px;
+    width: 34px;
+    height: 34px;
     border-radius: 6px;
     border: 1px solid #262433;
     background: transparent;
     color: #a8a3bd;
     cursor: pointer;
     font-size: 13px;
+  }
+  .exportBtn {
+    background: #1c1b22;
+    border: 1px solid #3a3850;
+    color: #4a8fb8;
+    border-radius: 7px;
+    padding: 8px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .clearAll {
+    background: transparent;
+    border: 1px solid #3a2828;
+    color: #a86b6b;
+    border-radius: 7px;
+    padding: 8px 14px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .clearAll.armed {
+    background: #c45b5b;
+    border: 1px solid #c45b5b;
+    color: #0d0c10;
+    font-weight: 600;
   }
 
   button:disabled {
