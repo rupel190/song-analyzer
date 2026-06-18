@@ -1184,13 +1184,21 @@
     flex-shrink: 0;
   }
 
-  /* Edit strip (selected block / marker) */
+  /* Edit strip (selected block / marker) — fixed bottom sheet so it's always
+     visible on a phone, no matter how tall the canvas is or where you've scrolled. */
   .editStrip {
-    margin-top: 12px;
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: 736px;
+    margin: 0 auto;
+    z-index: 20;
     padding: 12px;
-    background: #131218;
-    border: 1px solid #2a2740;
-    border-radius: 10px;
+    background: #161520;
+    border: 1px solid #3a3650;
+    border-radius: 12px;
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
   }
   .editHead {
     display: flex;
