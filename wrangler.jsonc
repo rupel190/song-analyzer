@@ -1,0 +1,11 @@
+{
+  // Static-assets Worker: serves the Vite build output in ./dist.
+  // The CI deploy command (`npx wrangler deploy`) needs this to know what to ship.
+  // Name must match the existing Worker so the deploy updates it (and keeps the
+  // song-analyzer.rupel.xyz custom domain attached).
+  "name": "song-analyzer",
+  "compatibility_date": "2025-06-18",
+  "assets": {
+    "directory": "./dist"
+  }
+}
