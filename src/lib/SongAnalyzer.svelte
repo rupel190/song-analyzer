@@ -87,6 +87,8 @@
   let laneArmedDelete = $state(false);
   let lanePreview = $state<{ laneId: string; from: number; to: number } | null>(null);
   let confirmClear = $state(false);
+  let editingLaneId = $state<string | null>(null);
+  let editingName = $state('');
 
   // ── Non-reactive refs ───────────────────────────────────────────────────────
   let audioCtx: AudioContext | null = null;
@@ -586,16 +588,30 @@
   function deleteBlock(laneId: string, blockId: string) {
     updateLaneBlocks(laneId, (blocks) => blocks.filter((bl) => bl.id !== blockId));
   }
-  function renameLane(laneId: string) {
-    const l = lanes.find((x) => x.id === laneId);
-    const name = window.prompt('Lane name', l?.name || '');
-    if (name != null && name.trim()) lanes = lanes.map((x) => (x.id === laneId ? { ...x, name: name.trim() } : x));
+  // Inline lane-name editing (replaces window.prompt — works on touch, and lets a
+  // freshly-added lane be named immediately).
+  function startEditLane(l: Lane) {
+    editingLaneId = l.id;
+    editingName = l.name;
+  }
+  function commitEditLane() {
+    if (editingLaneId == null) return;
+    const name = editingName.trim();
+    if (name) lanes = lanes.map((x) => (x.id === editingLaneId ? { ...x, name } : x));
+    editingLaneId = null;
+  }
+  const cancelEditLane = () => (editingLaneId = null);
+  function autofocus(node: HTMLInputElement) {
+    node.focus();
+    node.select();
   }
   const removeLane = (laneId: string) => (lanes = lanes.filter((x) => x.id !== laneId));
   function addLane() {
     const palette = ['#c45b5b', '#d4915d', '#9a7bb8', '#4a8fb8', '#7b9e7e', '#8f8f6b', '#b8709e', '#5fb0a8'];
     const color = palette[lanes.length % palette.length];
-    lanes = [...lanes, makeLane(`Lane ${lanes.length + 1}`, color)];
+    const lane = makeLane(`Lane ${lanes.length + 1}`, color);
+    lanes = [...lanes, lane];
+    startEditLane(lane); // open the name for editing right away
   }
 
   // ── BPM / grid controls ──────────────────────────────────────────────────────
@@ -818,15 +834,33 @@
 </script>
 
 <div class="app">
-  <header class="header">
-    <div>
-      <div class="kicker">SECTION MAP</div>
-      <h1 class="title">{fileName || 'Load a track to begin'}</h1>
+  <header class="topbar">
+    <div class="topbar-row">
+      <div class="titleblock">
+        <div class="kicker">SECTION MAP</div>
+        <h1 class="title">{fileName || 'Load a track to begin'}</h1>
+      </div>
+      <label class="loadBtn">
+        {loading ? 'Decoding…' : fileName ? 'Replace' : 'Load audio'}
+        <input type="file" accept="audio/*" onchange={handleFile} style="display:none" />
+      </label>
     </div>
-    <label class="loadBtn">
-      {loading ? 'Decoding…' : fileName ? 'Replace' : 'Load audio'}
-      <input type="file" accept="audio/*" onchange={handleFile} style="display:none" />
-    </label>
+    <div class="toolbar">
+      <div class="tgroup">
+        <button class="playBtn" onclick={togglePlay} disabled={!peaks}>{playing ? '❚❚' : '▶'}</button>
+        <div class="timeReadout">
+          <span class="timeNow">{fmtTime(position)}</span>
+          <span class="timeTotal">/ {fmtTime(duration)}</span>
+        </div>
+        <div class="barReadout">bar <strong style="color:#d4915d">{currentBar > 0 ? currentBar : '–'}</strong></div>
+      </div>
+      <div class="tgroup">
+        <button class="exportBtn" onclick={exportTSV} disabled={!showFooter}>{copied ? 'Copied ✓' : 'Copy TSV'}</button>
+        <button class="clearAll" class:armed={confirmClear} onclick={clearAll} disabled={!showFooter}>
+          {confirmClear ? 'Confirm?' : 'Clear all'}
+        </button>
+      </div>
+    </div>
   </header>
 
   <!-- BPM / grid controls -->
@@ -893,18 +927,6 @@
     {/if}
   </div>
 
-  <!-- Transport -->
-  <div class="transport">
-    <button class="playBtn" onclick={togglePlay} disabled={!peaks}>{playing ? '❚❚' : '▶'}</button>
-    <div class="timeReadout">
-      <span class="timeNow">{fmtTime(position)}</span>
-      <span class="timeTotal">/ {fmtTime(duration)}</span>
-    </div>
-    <div class="barReadout">
-      bar <strong style="color:#d4915d">{currentBar > 0 ? currentBar : '–'}</strong>
-    </div>
-  </div>
-
   <!-- Arrangement lane controls -->
   {#if peaks}
     <div class="listHead">
@@ -915,19 +937,24 @@
       {#each lanes as l (l.id)}
         <div class="laneChip" style="border-color:{l.color}55">
           <span class="laneDot" style="background:{l.color}"></span>
-          <button class="laneName" onclick={() => renameLane(l.id)}>{l.name}</button>
+          {#if editingLaneId === l.id}
+            <input
+              class="laneNameEdit"
+              value={editingName}
+              oninput={(e) => (editingName = e.currentTarget.value)}
+              onkeydown={(e) => {
+                if (e.key === 'Enter') commitEditLane();
+                else if (e.key === 'Escape') cancelEditLane();
+              }}
+              onblur={commitEditLane}
+              use:autofocus
+            />
+          {:else}
+            <button class="laneName" title="Rename lane" onclick={() => startEditLane(l)}>{l.name}</button>
+          {/if}
           <button class="laneRemove" title="Remove lane" onclick={() => removeLane(l.id)}>✕</button>
         </div>
       {/each}
-    </div>
-  {/if}
-
-  {#if showFooter}
-    <div class="footerRow">
-      <button class="exportBtn" onclick={exportTSV}>{copied ? 'Copied ✓' : 'Copy as TSV'}</button>
-      <button class="clearAll" class:armed={confirmClear} onclick={clearAll}>
-        {confirmClear ? 'Tap again to confirm' : 'Clear all'}
-      </button>
     </div>
   {/if}
 
@@ -969,12 +996,36 @@
     box-sizing: border-box;
   }
 
-  .header {
+  .topbar {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .topbar-row {
     display: flex;
     justify-content: space-between;
     align-items: flex-end;
     gap: 12px;
-    margin-bottom: 18px;
+  }
+  .titleblock {
+    min-width: 0;
+  }
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px 14px;
+    padding: 8px 12px;
+    background: #131218;
+    border: 1px solid #1f1d28;
+    border-radius: 10px;
+  }
+  .tgroup {
+    display: flex;
+    align-items: center;
+    gap: 12px;
   }
   .kicker {
     font-family: var(--mono);
@@ -1141,15 +1192,9 @@
     pointer-events: none;
   }
 
-  .transport {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    margin: 14px 2px;
-  }
   .playBtn {
-    width: 46px;
-    height: 46px;
+    width: 44px;
+    height: 44px;
     border-radius: 50%;
     border: 1px solid #3a3850;
     background: #1c1b22;
@@ -1173,7 +1218,6 @@
     color: #8e89a3;
   }
   .barReadout {
-    margin-left: auto;
     font-family: var(--mono);
     font-size: 13px;
     color: #a8a3bd;
@@ -1236,6 +1280,16 @@
     cursor: pointer;
     font-family: var(--sans);
   }
+  .laneNameEdit {
+    width: 84px;
+    background: #0d0c10;
+    border: 1px solid #3a3850;
+    border-radius: 4px;
+    color: #e8e4da;
+    font-size: 12px;
+    font-family: var(--sans);
+    padding: 1px 4px;
+  }
   .laneRemove {
     background: none;
     border: none;
@@ -1245,12 +1299,6 @@
     padding: 0 2px;
   }
 
-  .footerRow {
-    display: flex;
-    gap: 10px;
-    margin-top: 14px;
-    align-items: center;
-  }
   .exportBtn {
     background: #1c1b22;
     border: 1px solid #3a3850;
@@ -1269,7 +1317,6 @@
     padding: 8px 14px;
     font-size: 12px;
     cursor: pointer;
-    margin-left: auto;
   }
   .clearAll.armed {
     background: #c45b5b;
