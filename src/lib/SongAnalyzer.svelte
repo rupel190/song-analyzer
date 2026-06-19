@@ -86,6 +86,9 @@
   // Selection (tap-to-edit) — at most one of these is set at a time.
   let selectedBlock = $state<{ laneId: string; blockId: string } | null>(null);
   let selectedMarkerId = $state<number | null>(null);
+  // True while a block is being drawn by dragging — used to hide its edit popups
+  // so they don't jump around mid-drag.
+  let creating = $state(false);
 
   // ── Non-reactive refs ───────────────────────────────────────────────────────
   let audioCtx: AudioContext | null = null;
@@ -97,6 +100,16 @@
   let canvasEl = $state<HTMLCanvasElement>();
   let wrapEl = $state<HTMLDivElement>();
   let tapsRef: number[] = [];
+  // In-flight drag for creating a block: armed on pointerdown over an empty lane,
+  // promoted to a real block on the first bar of horizontal movement.
+  let pendingCreate: {
+    laneId: string;
+    anchorBar: number;
+    pointerId: number;
+    blockId: string | null;
+  } | null = null;
+  // Set when a drag created a block so the trailing click doesn't also fire.
+  let suppressClick = false;
 
   // ── Derived bar helpers ──────────────────────────────────────────────────────
   const secPerBar = $derived((60 / bpm) * beatsPerBar);
@@ -124,6 +137,25 @@
   const selectedMarker = $derived.by(() => {
     const id = selectedMarkerId;
     return id == null ? null : (markers.find((m) => m.id === id) ?? null);
+  });
+  // Screen-space box of the selected block (canvas CSS px = overlay coords), used
+  // to anchor the floating edit popups above and below it.
+  const selectedBlockRect = $derived.by(() => {
+    const s = selectedBlock;
+    const b = selectedBlockData;
+    if (!s || !b) return null;
+    const li = lanes.findIndex((l) => l.id === s.laneId);
+    if (li < 0) return null;
+    const x1 = laneTimeToX(timeAtBar(b.startBar));
+    const x2 = laneTimeToX(timeAtBar(b.endBar));
+    const top = WAVE_H + GAP + li * (LANE_H + LANE_GAP);
+    return { centerX: (x1 + x2) / 2, top, bottom: top + LANE_H };
+  });
+  // Anchor point for the marker popup: on the marker line, just under its label.
+  const selectedMarkerRect = $derived.by(() => {
+    const m = selectedMarker;
+    if (!m || !duration) return null;
+    return { centerX: (m.t / duration) * plotWidth, top: 22 };
   });
 
   // Hoisted so the derived values above can reference them.
@@ -315,6 +347,10 @@
 
   // ── Tap handling (everything is a tap; drags scroll the page) ──────────────────
   function handleCanvasClick(e: MouseEvent) {
+    if (suppressClick) {
+      suppressClick = false; // this "click" was the tail of a drag-create
+      return;
+    }
     if (!duration || !canvasEl) return;
     const rect = canvasEl.getBoundingClientRect();
     const px = e.clientX - rect.left;
@@ -398,24 +434,85 @@
     selectBlock(lane.id, block.id);
   }
 
-  // ── Block steppers (each adjusts one field by ±1 bar, clamped) ─────────────────
+  // ── Drag-to-create a block (size it by dragging from the start) ──────────────────
+  // touch-action: pan-y on the canvas lets a vertical drag scroll the page while a
+  // horizontal drag is delivered to us here. A plain tap still makes a default block.
+  function onCanvasPointerDown(e: PointerEvent) {
+    if (!duration || !canvasEl || !peaks) return;
+    const rect = canvasEl.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    if (py < WAVE_H + GAP) return; // waveform region: seeking/markers go through click
+    const li = laneIndexAtY(py);
+    if (li < 0) return;
+    if (blockAt(px, li)) return; // pressing an existing block: let click select it
+    const anchorBar = clamp(snapBar(laneXToBarFloat(px)), 1, totalBars + 1);
+    pendingCreate = { laneId: lanes[li].id, anchorBar, pointerId: e.pointerId, blockId: null };
+  }
+  function onCanvasPointerMove(e: PointerEvent) {
+    const pc = pendingCreate;
+    if (!pc || e.pointerId !== pc.pointerId || !canvasEl) return;
+    const rect = canvasEl.getBoundingClientRect();
+    const curBar = clamp(snapBar(laneXToBarFloat(e.clientX - rect.left)), 1, totalBars + 1);
+    let lo = Math.min(pc.anchorBar, curBar);
+    let hi = Math.max(pc.anchorBar, curBar);
+    if (hi - lo < 1) hi = Math.min(totalBars + 1, lo + 1); // never thinner than one bar
+    if (hi - lo < 1) lo = hi - 1;
+    if (pc.blockId == null) {
+      if (Math.abs(curBar - pc.anchorBar) < 1) return; // wait for a full bar before creating
+      const block: Block = {
+        id: `blk_${blockIdCounter++}_${Date.now()}`,
+        startBar: lo,
+        endBar: hi,
+        fadeInBars: 0,
+        fadeOutBars: 0,
+      };
+      lanes = lanes.map((l) =>
+        l.id === pc.laneId
+          ? { ...l, blocks: [...l.blocks, block].sort((x, y) => x.startBar - y.startBar) }
+          : l
+      );
+      pc.blockId = block.id;
+      creating = true;
+      selectBlock(pc.laneId, block.id);
+      canvasEl.setPointerCapture(pc.pointerId);
+    } else {
+      patchBlock(pc.laneId, pc.blockId, { startBar: lo, endBar: hi });
+    }
+  }
+  function endCanvasPointer(e: PointerEvent) {
+    const pc = pendingCreate;
+    if (!pc || e.pointerId !== pc.pointerId) return;
+    if (pc.blockId != null) suppressClick = true; // a real drag happened; swallow the click
+    creating = false;
+    pendingCreate = null;
+    try {
+      canvasEl?.releasePointerCapture(e.pointerId);
+    } catch {
+      /* pointer wasn't captured */
+    }
+  }
+
+  // ── Block steppers ─────────────────────────────────────────────────────────────
+  // Start / End move that edge by ±1 bar and carry the fade rigidly with it: the
+  // fade *lengths* never change, so the block's shape is preserved and no fade is
+  // ever invented where there was none. The only limit is that the block can't
+  // shrink shorter than its two fades combined. Fade In / Out adjust ramp lengths.
   function stepStart(d: number) {
     const s = selectedBlock;
     const b = selectedBlockData;
     if (!s || !b) return;
-    const newStart = clamp(b.startBar + d, 1, b.endBar - 1);
-    const apexInAbs = b.startBar + b.fadeInBars; // hold the fade-in apex in place
-    const fadeIn = clamp(apexInAbs - newStart, 0, b.endBar - newStart - b.fadeOutBars);
-    patchBlock(s.laneId, s.blockId, { startBar: newStart, fadeInBars: fadeIn });
+    const minLen = Math.max(1, b.fadeInBars + b.fadeOutBars);
+    const newStart = clamp(b.startBar + d, 1, b.endBar - minLen);
+    patchBlock(s.laneId, s.blockId, { startBar: newStart });
   }
   function stepEnd(d: number) {
     const s = selectedBlock;
     const b = selectedBlockData;
     if (!s || !b) return;
-    const newEnd = clamp(b.endBar + d, b.startBar + 1, totalBars + 1);
-    const apexOutAbs = b.endBar - b.fadeOutBars; // hold the fade-out apex in place
-    const fadeOut = clamp(newEnd - apexOutAbs, 0, newEnd - b.startBar - b.fadeInBars);
-    patchBlock(s.laneId, s.blockId, { endBar: newEnd, fadeOutBars: fadeOut });
+    const minLen = Math.max(1, b.fadeInBars + b.fadeOutBars);
+    const newEnd = clamp(b.endBar + d, b.startBar + minLen, totalBars + 1);
+    patchBlock(s.laneId, s.blockId, { endBar: newEnd });
   }
   function stepFadeIn(d: number) {
     const s = selectedBlock;
@@ -822,70 +919,103 @@
 
   <!-- Waveform + arrangement canvas -->
   <div class="canvasWrap" bind:this={wrapEl}>
-    <canvas bind:this={canvasEl} class="canvas" style="cursor:{cursor}" onclick={handleCanvasClick}></canvas>
+    <canvas
+      bind:this={canvasEl}
+      class="canvas"
+      style="cursor:{cursor}"
+      onclick={handleCanvasClick}
+      onpointerdown={onCanvasPointerDown}
+      onpointermove={onCanvasPointerMove}
+      onpointerup={endCanvasPointer}
+      onpointercancel={endCanvasPointer}
+    ></canvas>
     {#if !peaks}
       <div class="placeholder">{loading ? 'Reading waveform…' : 'Waveform appears here'}</div>
     {/if}
-  </div>
 
-  <!-- Edit strip for the currently selected block / marker -->
-  {#if selectedBlockData && selectedLane}
-    <div class="editStrip">
-      <div class="editHead">
-        <span class="laneDot" style="background:{selectedLane.color}"></span>
-        <strong class="editName">{selectedLane.name}</strong>
-        <span class="editSub">bars {selectedBlockData.startBar}–{selectedBlockData.endBar}</span>
-        <button class="editDel" onclick={deleteSelectedBlock}>Delete</button>
-        <button class="editDone" onclick={deselect}>Done</button>
-      </div>
-      <div class="stepGrid">
-        <div class="stepCtl">
-          <span class="stepLbl">Start</span>
-          <button class="bigStep" onclick={() => stepStart(-1)}>−</button>
-          <span class="stepVal">{selectedBlockData.startBar}</span>
-          <button class="bigStep" onclick={() => stepStart(1)}>+</button>
+    <!-- Floating edit popups, anchored to the selected block: start/end above,
+         fades below. pointer-events:none on the layer lets taps fall through to
+         the canvas everywhere except on the popups themselves. -->
+    {#if selectedBlockRect && selectedLane && selectedBlockData && !creating}
+      {@const r = selectedBlockRect}
+      {@const cx = Math.max(98, Math.min(plotWidth - 98, r.centerX))}
+      <div class="blockPop above" style="left:{cx}px; top:{r.top}px;">
+        <div class="popHead">
+          <span class="laneDot" style="background:{selectedLane.color}"></span>
+          <strong class="popName">{selectedLane.name}</strong>
+          <span class="popSub">bars {selectedBlockData.startBar}–{selectedBlockData.endBar}</span>
+          <button class="popDel" title="Delete block" onclick={deleteSelectedBlock}>✕</button>
+          <button class="popDone" title="Done" onclick={deselect}>✓</button>
         </div>
-        <div class="stepCtl">
-          <span class="stepLbl">End</span>
-          <button class="bigStep" onclick={() => stepEnd(-1)}>−</button>
-          <span class="stepVal">{selectedBlockData.endBar}</span>
-          <button class="bigStep" onclick={() => stepEnd(1)}>+</button>
-        </div>
-        <div class="stepCtl">
-          <span class="stepLbl">Fade in</span>
-          <button class="bigStep" onclick={() => stepFadeIn(-1)}>−</button>
-          <span class="stepVal">{selectedBlockData.fadeInBars}</span>
-          <button class="bigStep" onclick={() => stepFadeIn(1)}>+</button>
-        </div>
-        <div class="stepCtl">
-          <span class="stepLbl">Fade out</span>
-          <button class="bigStep" onclick={() => stepFadeOut(-1)}>−</button>
-          <span class="stepVal">{selectedBlockData.fadeOutBars}</span>
-          <button class="bigStep" onclick={() => stepFadeOut(1)}>+</button>
+        <div class="popRow">
+          <div class="popCtl">
+            <span class="popLbl">Start</span>
+            <button class="popStep" onclick={() => stepStart(-1)}>−</button>
+            <span class="popVal">{selectedBlockData.startBar}</span>
+            <button class="popStep" onclick={() => stepStart(1)}>+</button>
+          </div>
+          <div class="popCtl">
+            <span class="popLbl">End</span>
+            <button class="popStep" onclick={() => stepEnd(-1)}>−</button>
+            <span class="popVal">{selectedBlockData.endBar}</span>
+            <button class="popStep" onclick={() => stepEnd(1)}>+</button>
+          </div>
         </div>
       </div>
-    </div>
-  {:else if selectedMarker}
-    <div class="editStrip">
-      <div class="editHead">
-        <span class="laneDot" style="background:{selectedMarker.color}"></span>
-        <strong class="editName">{selectedMarker.name}</strong>
-        <span class="editSub">{fmtTime(selectedMarker.t)} · bar {barAtTime(selectedMarker.t)}</span>
-        <button class="editDel" onclick={() => { if (selectedMarkerId != null) deleteMarker(selectedMarkerId); deselect(); }}>Delete</button>
-        <button class="editDone" onclick={deselect}>Done</button>
-      </div>
-      <div class="stepGrid">
-        <div class="stepCtl">
-          <span class="stepLbl">Move</span>
-          <button class="bigStep" onclick={() => nudgeMarker(-0.1)}>◀</button>
-          <span class="stepVal">{selectedMarker.t.toFixed(2)}s</span>
-          <button class="bigStep" onclick={() => nudgeMarker(0.1)}>▶</button>
+      <div class="blockPop below" style="left:{cx}px; top:{r.bottom}px;">
+        <div class="popRow">
+          <div class="popCtl">
+            <span class="popLbl">Fade in</span>
+            <button class="popStep" onclick={() => stepFadeIn(-1)}>−</button>
+            <span class="popVal">{selectedBlockData.fadeInBars}</span>
+            <button class="popStep" onclick={() => stepFadeIn(1)}>+</button>
+          </div>
+          <div class="popCtl">
+            <span class="popLbl">Fade out</span>
+            <button class="popStep" onclick={() => stepFadeOut(-1)}>−</button>
+            <span class="popVal">{selectedBlockData.fadeOutBars}</span>
+            <button class="popStep" onclick={() => stepFadeOut(1)}>+</button>
+          </div>
         </div>
-        <button class="editRename" onclick={() => { if (selectedMarkerId != null) renameMarker(selectedMarkerId); }}>Rename</button>
       </div>
-      <div class="editHint">Tip: tap the waveform to move this marker there.</div>
-    </div>
-  {/if}
+    {/if}
+
+    <!-- Marker edit popup, anchored on the marker line just below its label. -->
+    {#if selectedMarker && selectedMarkerRect}
+      {@const cx = Math.max(98, Math.min(plotWidth - 98, selectedMarkerRect.centerX))}
+      <div class="blockPop marker" style="left:{cx}px; top:{selectedMarkerRect.top}px;">
+        <div class="popHead">
+          <span class="laneDot" style="background:{selectedMarker.color}"></span>
+          <strong class="popName">{selectedMarker.name}</strong>
+          <span class="popSub">{fmtTime(selectedMarker.t)} · bar {barAtTime(selectedMarker.t)}</span>
+          <button
+            class="popDel"
+            title="Delete marker"
+            onclick={() => {
+              if (selectedMarkerId != null) deleteMarker(selectedMarkerId);
+              deselect();
+            }}>✕</button
+          >
+          <button class="popDone" title="Done" onclick={deselect}>✓</button>
+        </div>
+        <div class="popRow">
+          <div class="popCtl">
+            <span class="popLbl">Move</span>
+            <button class="popStep" onclick={() => nudgeMarker(-0.1)}>◀</button>
+            <span class="popVal wide">{selectedMarker.t.toFixed(2)}s</span>
+            <button class="popStep" onclick={() => nudgeMarker(0.1)}>▶</button>
+          </div>
+          <button
+            class="popRename"
+            onclick={() => {
+              if (selectedMarkerId != null) renameMarker(selectedMarkerId);
+            }}>Rename</button
+          >
+        </div>
+        <div class="popHint">Tip: tap the waveform to move this marker there.</div>
+      </div>
+    {/if}
+  </div>
 
   <!-- Arrangement lane controls -->
   {#if peaks}
@@ -1132,14 +1262,19 @@
     position: relative;
     width: 100%;
     border-radius: 10px;
-    overflow: hidden;
+    /* visible (not hidden) so the block edit popups can extend above/below the
+       canvas frame; the canvas keeps its own rounded corners. */
+    overflow: visible;
     border: 1px solid #262433;
     margin-top: 16px;
   }
   .canvas {
     display: block;
     width: 100%;
-    touch-action: manipulation;
+    border-radius: 10px;
+    /* pan-y: vertical drags still scroll the page; horizontal drags reach our
+       pointer handlers to size a new block. pinch-zoom stays available. */
+    touch-action: pan-y pinch-zoom;
   }
   .placeholder {
     position: absolute;
@@ -1151,6 +1286,119 @@
     font-size: 13px;
     font-family: var(--mono);
     pointer-events: none;
+  }
+
+  /* Floating block-edit popups, positioned in canvas pixel coordinates. */
+  .blockPop {
+    position: absolute;
+    z-index: 15;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 10px;
+    background: #161520;
+    border: 1px solid #3a3650;
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    max-width: 92vw;
+  }
+  .blockPop.above {
+    /* center on the block, sit just above the lane row */
+    transform: translate(-50%, calc(-100% - 8px));
+  }
+  .blockPop.below {
+    /* center on the block, sit just below the lane row */
+    transform: translate(-50%, 8px);
+  }
+  .popHead {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .popName {
+    color: #e8e4da;
+    font-size: 12px;
+  }
+  .popSub {
+    color: #8e89a3;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .popDel {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid #3a2828;
+    color: #a86b6b;
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .popDone {
+    background: #1c1b22;
+    border: 1px solid #3a3850;
+    color: #4a8fb8;
+    border-radius: 6px;
+    padding: 3px 9px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .popRow {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .popCtl {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .popLbl {
+    font-size: 9px;
+    font-family: var(--mono);
+    letter-spacing: 0.06em;
+    color: #8e89a3;
+    text-transform: uppercase;
+    margin-right: 2px;
+  }
+  .popStep {
+    width: 34px;
+    height: 34px;
+    border-radius: 7px;
+    border: 1px solid #3a3850;
+    background: #1c1b22;
+    color: #e8e4da;
+    font-size: 18px;
+    cursor: pointer;
+  }
+  .popVal {
+    min-width: 26px;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 14px;
+    color: #e8e4da;
+  }
+  .popVal.wide {
+    min-width: 58px;
+  }
+  /* The marker popup hangs straight down from its anchor (no vertical flip). */
+  .blockPop.marker {
+    transform: translateX(-50%);
+  }
+  .popRename {
+    background: #1c1b22;
+    border: 1px solid #3a3850;
+    color: #cfcad9;
+    border-radius: 7px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .popHint {
+    font-size: 10px;
+    color: #6a6780;
+    font-family: var(--mono);
   }
 
   .timeReadout {
@@ -1182,110 +1430,6 @@
     font-size: 15px;
     cursor: pointer;
     flex-shrink: 0;
-  }
-
-  /* Edit strip (selected block / marker) — fixed bottom sheet so it's always
-     visible on a phone, no matter how tall the canvas is or where you've scrolled. */
-  .editStrip {
-    position: fixed;
-    left: 12px;
-    right: 12px;
-    bottom: 12px;
-    max-width: 736px;
-    margin: 0 auto;
-    z-index: 20;
-    padding: 12px;
-    background: #161520;
-    border: 1px solid #3a3650;
-    border-radius: 12px;
-    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
-  }
-  .editHead {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 10px;
-    flex-wrap: wrap;
-  }
-  .editName {
-    color: #e8e4da;
-    font-size: 14px;
-  }
-  .editSub {
-    color: #8e89a3;
-    font-family: var(--mono);
-    font-size: 12px;
-  }
-  .editDel {
-    margin-left: auto;
-    background: transparent;
-    border: 1px solid #3a2828;
-    color: #a86b6b;
-    border-radius: 6px;
-    padding: 6px 10px;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .editDone {
-    background: #1c1b22;
-    border: 1px solid #3a3850;
-    color: #4a8fb8;
-    border-radius: 6px;
-    padding: 6px 14px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .stepGrid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px 16px;
-    align-items: center;
-  }
-  .stepCtl {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .stepLbl {
-    font-size: 10px;
-    font-family: var(--mono);
-    letter-spacing: 0.08em;
-    color: #8e89a3;
-    text-transform: uppercase;
-    min-width: 52px;
-  }
-  .bigStep {
-    width: 40px;
-    height: 40px;
-    border-radius: 8px;
-    border: 1px solid #3a3850;
-    background: #1c1b22;
-    color: #e8e4da;
-    font-size: 20px;
-    cursor: pointer;
-  }
-  .stepVal {
-    min-width: 46px;
-    text-align: center;
-    font-family: var(--mono);
-    font-size: 15px;
-    color: #e8e4da;
-  }
-  .editRename {
-    background: #1c1b22;
-    border: 1px solid #3a3850;
-    color: #cfcad9;
-    border-radius: 8px;
-    padding: 8px 14px;
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .editHint {
-    margin-top: 8px;
-    font-size: 11px;
-    color: #6a6780;
-    font-family: var(--mono);
   }
 
   .listHead {

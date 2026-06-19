@@ -12,11 +12,16 @@ Live: https://songanalyzer.rupel.xyz
 
 - Waveform rendering via the Web Audio API (`decodeAudioData` + downsampled peaks).
 - BPM control with tap-tempo, adjustable bar-1 offset, and a toggleable bar grid.
-- Section markers: tap to place (auto-selected), tap the waveform to reposition, nudge, rename, delete.
-- Arrangement lanes: tap an empty lane to add a block, tap a block to select it, then set
-  start / end / fade-in / fade-out with steppers (bar-snapped).
+- Section markers: tap a section to place one (auto-selected), then edit it from a popup
+  pinned to the marker — nudge, rename, delete, or tap the waveform to move it there.
+- Arrangement lanes: tap an empty lane for a default block, or **drag from where you press to
+  size one** (bar-snapped). Tap a block to select it; a popup above sets start / end and one
+  below sets fade-in / fade-out.
+- Start / end move that edge and carry the fade rigidly — the fade length (and the block's
+  shape) never changes, and no fade is invented where there wasn't one.
 - Per-file persistence (keyed by name + size) and TSV export to the clipboard.
-- Touch-first: tap to select, steppers to edit, and the page pans/zooms normally (built for mobile).
+- Touch-first: vertical drags scroll and pinch zooms as normal; a horizontal drag on a lane
+  sizes a new block. Edit popups stay anchored to whatever you've selected (built for mobile).
 
 ## Development
 
