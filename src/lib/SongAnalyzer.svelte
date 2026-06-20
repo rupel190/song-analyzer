@@ -52,7 +52,7 @@
   const LANE_H = 46;
   const LANE_GAP = 6;
   const beatsPerBar = 4;
-  const MARKER_TAP_TOL = 12; // px tolerance for tapping a marker line
+  const MARKER_LABEL_H = 18; // a marker is only "hit" within its top label band
   const DEFAULT_BLOCK_BARS = 4; // length of a block created by tapping a lane
 
   let laneIdCounter = 1;
@@ -300,6 +300,13 @@
       playFrom(position);
     }
   }
+  // Jump the playhead by whole bars for quick re-listen: from bar 42, three taps
+  // of «bar lands you at the start of bar 39. seekTo restarts playback if playing.
+  function skipBars(d: number) {
+    if (!buffer || !duration) return;
+    const target = clamp(barAtTime(position) + d, 1, totalBars + 1);
+    seekTo(clamp(timeAtBar(target), 0, duration));
+  }
 
   // ── Canvas geometry ──────────────────────────────────────────────────────────
   const timeAtX = (clientX: number): number | null => {
@@ -331,18 +338,21 @@
     }
     return null;
   }
+  // Measure a label the same way draw() does, so the hit-box matches what's drawn.
+  function markerLabelWidth(name: string): number {
+    const ctx = canvasEl?.getContext('2d');
+    if (!ctx) return name.length * 6.5 + 10;
+    ctx.font = '11px ui-sans-serif, system-ui';
+    return ctx.measureText(name).width + 10;
+  }
+  // Only the top label box grabs a marker — taps elsewhere on the line seek instead.
   function markerAt(px: number, py: number): number | null {
-    if (!duration || py < 0 || py > WAVE_H) return null;
-    let best: number | null = null;
-    let bestDist = MARKER_TAP_TOL;
+    if (!duration || py < 0 || py > MARKER_LABEL_H) return null;
     for (const m of markers) {
-      const d = Math.abs(px - (m.t / duration) * plotWidth);
-      if (d < bestDist) {
-        bestDist = d;
-        best = m.id;
-      }
+      const x = (m.t / duration) * plotWidth;
+      if (px >= x - 2 && px <= x + markerLabelWidth(m.name)) return m.id;
     }
-    return best;
+    return null;
   }
 
   // ── Tap handling (everything is a tap; drags scroll the page) ──────────────────
@@ -375,16 +385,10 @@
     }
 
     // ── waveform region: markers + seek ──
+    // A marker is grabbed only by its label (see markerAt); tapping anywhere else
+    // seeks — even with a marker selected — so you can re-listen while adjusting.
+    // Markers then move by whole bars via the popup's ◀ ▶.
     const mk = markerAt(px, py);
-    if (selectedMarkerId != null) {
-      if (mk != null) {
-        selectMarker(mk); // switch to another marker
-      } else {
-        const t = timeAtX(e.clientX);
-        if (t != null) moveMarkerTo(selectedMarkerId, t); // move the selected one here
-      }
-      return;
-    }
     if (mk != null) {
       selectMarker(mk);
       return;
@@ -396,10 +400,10 @@
       activeSection = null; // exit place-mode so the new marker is editable
       selectMarker(id); // auto-select it
       seekTo(t);
-    } else {
-      deselect();
-      seekTo(t);
+      return;
     }
+    if (selectedBlock) deselect(); // tapping the waveform drops a block selection
+    seekTo(t);
   }
 
   function selectBlock(laneId: string, blockId: string) {
@@ -550,9 +554,13 @@
       .map((m) => (m.id === id ? { ...m, t: clamp(t, 0, duration) } : m))
       .sort((a, b) => a.t - b.t);
   }
-  function nudgeMarker(d: number) {
+  // Move the selected marker by whole bars (snaps onto the bar grid). Bar
+  // granularity is enough for marking where a section starts.
+  function stepMarkerBar(d: number) {
     const m = selectedMarker;
-    if (m) moveMarkerTo(m.id, m.t + d);
+    if (!m) return;
+    const bar = clamp(snapBar(barFloatAtTime(m.t) + d), 1, totalBars + 1);
+    moveMarkerTo(m.id, timeAtBar(bar));
   }
   function renameMarker(id: number) {
     const m = markers.find((x) => x.id === id);
@@ -600,6 +608,100 @@
     }
   }
 
+  // ── TSV import ─────────────────────────────────────────────────────────────────
+  // Reads the same shape exportTSV writes (a Section block then a Lane block) from
+  // the clipboard and rebuilds the map. Marker times come back at second precision
+  // (that's all the export carries); block bars are exact.
+  function parseTimeStr(s: string): number {
+    const parts = s.split(':').map((p) => parseFloat(p));
+    if (!parts.length || parts.some((n) => isNaN(n))) return NaN;
+    return parts.reduce((acc, n) => acc * 60 + n, 0);
+  }
+  async function importTSV() {
+    if (!peaks || !duration) {
+      alert('Load the track first, then import its map.');
+      return;
+    }
+    let text = '';
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      text = window.prompt('Paste the TSV map here:') ?? '';
+    }
+    if (text.trim()) applyTSV(text);
+  }
+  function applyTSV(text: string) {
+    const palette = ['#c45b5b', '#d4915d', '#9a7bb8', '#4a8fb8', '#7b9e7e', '#8f8f6b', '#b8709e', '#5fb0a8'];
+    const newMarkers: Marker[] = [];
+    // Seed with existing lanes so a matching name keeps its id/color; blocks reset.
+    const laneMap = new Map<string, Lane>();
+    for (const l of lanes) laneMap.set(l.name.toLowerCase(), { ...l, blocks: [] });
+    let importedBpm: number | null = null;
+    let mode: 'markers' | 'blocks' | null = null;
+
+    for (const raw of text.split(/\r?\n/)) {
+      if (!raw.trim()) {
+        mode = null;
+        continue;
+      }
+      const cells = raw.split('\t');
+      const head = cells[0].trim().toLowerCase();
+      if (head === 'section') {
+        mode = 'markers';
+        continue;
+      }
+      if (head === 'lane') {
+        mode = 'blocks';
+        continue;
+      }
+      if (mode === 'markers') {
+        const name = cells[0]?.trim();
+        const t = parseTimeStr((cells[1] ?? '').trim());
+        if (!name || isNaN(t)) continue;
+        const color = SECTIONS.find((s) => s.name.toLowerCase() === name.toLowerCase())?.color ?? '#6b7a8f';
+        newMarkers.push({ id: Date.now() + Math.random(), t: clamp(t, 0, duration), name, color });
+        const bv = parseFloat(cells[3]);
+        if (bv >= 40 && bv <= 300) importedBpm = bv;
+      } else if (mode === 'blocks') {
+        const laneName = cells[0]?.trim();
+        const startBar = parseInt(cells[1], 10);
+        const endBar = parseInt(cells[2], 10);
+        if (!laneName || isNaN(startBar) || isNaN(endBar) || endBar <= startBar) continue;
+        const len = endBar - startBar;
+        const fi = clamp(parseInt(cells[3], 10) || 0, 0, len);
+        const fo = clamp(parseInt(cells[4], 10) || 0, 0, len - fi);
+        const key = laneName.toLowerCase();
+        let lane = laneMap.get(key);
+        if (!lane) {
+          lane = makeLane(laneName, palette[laneMap.size % palette.length]);
+          laneMap.set(key, lane);
+        }
+        lane.blocks.push({
+          id: `blk_${blockIdCounter++}_${Date.now()}`,
+          startBar,
+          endBar,
+          fadeInBars: fi,
+          fadeOutBars: fo,
+        });
+      }
+    }
+
+    if (importedBpm) bpm = importedBpm;
+    markers = newMarkers.sort((a, b) => a.t - b.t);
+    // Existing lanes keep their order; lanes only present in the TSV get appended.
+    const ordered: Lane[] = [];
+    for (const l of lanes) {
+      const u = laneMap.get(l.name.toLowerCase());
+      if (u) {
+        ordered.push(u);
+        laneMap.delete(l.name.toLowerCase());
+      }
+    }
+    for (const u of laneMap.values()) ordered.push(u);
+    lanes = ordered.map((l) => ({ ...l, blocks: [...l.blocks].sort((x, y) => x.startBar - y.startBar) }));
+    deselect();
+  }
+
   // ── Lane / block operations ────────────────────────────────────────────────────
   function updateLaneBlocks(laneId: string, updater: (blocks: Block[]) => Block[]) {
     lanes = lanes.map((l) => (l.id === laneId ? { ...l, blocks: updater(l.blocks) } : l));
@@ -626,6 +728,45 @@
   function autofocus(node: HTMLInputElement) {
     node.focus();
     node.select();
+  }
+
+  // Press-and-hold a stepper to repeat it: one step immediately, then auto-repeat
+  // after a short delay so you can hold to move several bars instead of tapping.
+  // Used instead of onclick on the popup steppers (so a tap = exactly one step).
+  function holdRepeat(node: HTMLElement, fn: () => void) {
+    let current = fn;
+    let to: ReturnType<typeof setTimeout> | undefined;
+    let iv: ReturnType<typeof setInterval> | undefined;
+    const stop = () => {
+      clearTimeout(to);
+      clearInterval(iv);
+      to = iv = undefined;
+    };
+    const down = (e: PointerEvent) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      current();
+      to = setTimeout(() => {
+        iv = setInterval(() => current(), 80);
+      }, 320);
+      try {
+        node.setPointerCapture(e.pointerId);
+      } catch {
+        /* capture unsupported — pointerup still stops it */
+      }
+    };
+    node.addEventListener('pointerdown', down);
+    node.addEventListener('pointerup', stop);
+    node.addEventListener('pointercancel', stop);
+    return {
+      update: (fn2: () => void) => (current = fn2),
+      destroy: () => {
+        stop();
+        node.removeEventListener('pointerdown', down);
+        node.removeEventListener('pointerup', stop);
+        node.removeEventListener('pointercancel', stop);
+      },
+    };
   }
   function removeLane(laneId: string) {
     if (selectedBlock?.laneId === laneId) selectedBlock = null;
@@ -859,7 +1000,9 @@
     </div>
     <div class="toolbar">
       <div class="tgroup">
+        <button class="skipBtn" onclick={() => skipBars(-1)} disabled={!peaks} title="Back one bar" aria-label="Back one bar">«bar</button>
         <button class="playBtn" onclick={togglePlay} disabled={!peaks}>{playing ? '❚❚' : '▶'}</button>
+        <button class="skipBtn" onclick={() => skipBars(1)} disabled={!peaks} title="Forward one bar" aria-label="Forward one bar">bar»</button>
         <div class="timeReadout">
           <span class="timeNow">{fmtTime(position)}</span>
           <span class="timeTotal">/ {fmtTime(duration)}</span>
@@ -867,6 +1010,7 @@
         <div class="barReadout">bar <strong style="color:#d4915d">{currentBar > 0 ? currentBar : '–'}</strong></div>
       </div>
       <div class="tgroup">
+        <button class="exportBtn" onclick={importTSV} disabled={!peaks}>Import TSV</button>
         <button class="exportBtn" onclick={exportTSV} disabled={!showFooter}>{copied ? 'Copied ✓' : 'Copy TSV'}</button>
         <button class="clearAll" class:armed={confirmClear} onclick={clearAll} disabled={!showFooter}>
           {confirmClear ? 'Confirm?' : 'Clear all'}
@@ -950,15 +1094,15 @@
         <div class="popRow">
           <div class="popCtl">
             <span class="popLbl">Start</span>
-            <button class="popStep" onclick={() => stepStart(-1)}>−</button>
+            <button class="popStep" use:holdRepeat={() => stepStart(-1)}>−</button>
             <span class="popVal">{selectedBlockData.startBar}</span>
-            <button class="popStep" onclick={() => stepStart(1)}>+</button>
+            <button class="popStep" use:holdRepeat={() => stepStart(1)}>+</button>
           </div>
           <div class="popCtl">
             <span class="popLbl">End</span>
-            <button class="popStep" onclick={() => stepEnd(-1)}>−</button>
+            <button class="popStep" use:holdRepeat={() => stepEnd(-1)}>−</button>
             <span class="popVal">{selectedBlockData.endBar}</span>
-            <button class="popStep" onclick={() => stepEnd(1)}>+</button>
+            <button class="popStep" use:holdRepeat={() => stepEnd(1)}>+</button>
           </div>
         </div>
       </div>
@@ -966,15 +1110,15 @@
         <div class="popRow">
           <div class="popCtl">
             <span class="popLbl">Fade in</span>
-            <button class="popStep" onclick={() => stepFadeIn(-1)}>−</button>
+            <button class="popStep" use:holdRepeat={() => stepFadeIn(-1)}>−</button>
             <span class="popVal">{selectedBlockData.fadeInBars}</span>
-            <button class="popStep" onclick={() => stepFadeIn(1)}>+</button>
+            <button class="popStep" use:holdRepeat={() => stepFadeIn(1)}>+</button>
           </div>
           <div class="popCtl">
             <span class="popLbl">Fade out</span>
-            <button class="popStep" onclick={() => stepFadeOut(-1)}>−</button>
+            <button class="popStep" use:holdRepeat={() => stepFadeOut(-1)}>−</button>
             <span class="popVal">{selectedBlockData.fadeOutBars}</span>
-            <button class="popStep" onclick={() => stepFadeOut(1)}>+</button>
+            <button class="popStep" use:holdRepeat={() => stepFadeOut(1)}>+</button>
           </div>
         </div>
       </div>
@@ -1001,9 +1145,9 @@
         <div class="popRow">
           <div class="popCtl">
             <span class="popLbl">Move</span>
-            <button class="popStep" onclick={() => nudgeMarker(-0.1)}>◀</button>
-            <span class="popVal wide">{selectedMarker.t.toFixed(2)}s</span>
-            <button class="popStep" onclick={() => nudgeMarker(0.1)}>▶</button>
+            <button class="popStep" use:holdRepeat={() => stepMarkerBar(-1)}>◀</button>
+            <span class="popVal wide">bar {barAtTime(selectedMarker.t)}</span>
+            <button class="popStep" use:holdRepeat={() => stepMarkerBar(1)}>▶</button>
           </div>
           <button
             class="popRename"
@@ -1012,7 +1156,7 @@
             }}>Rename</button
           >
         </div>
-        <div class="popHint">Tip: tap the waveform to move this marker there.</div>
+        <div class="popHint">◀ ▶ move by a bar · tap the waveform to seek &amp; re-listen.</div>
       </div>
     {/if}
   </div>
@@ -1428,6 +1572,20 @@
     background: #1c1b22;
     color: #e8e4da;
     font-size: 15px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .skipBtn {
+    height: 38px;
+    min-width: 44px;
+    padding: 0 10px;
+    border-radius: 8px;
+    border: 1px solid #3a3850;
+    background: #1c1b22;
+    color: #cfcad9;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
     cursor: pointer;
     flex-shrink: 0;
   }
