@@ -1,4 +1,4 @@
-# Song Analyzer
+# Song Map
 
 A client-side tool for mapping the structure of a track: load an audio file, see its
 waveform, lay a BPM bar-grid over it, drop color-coded **section markers** (intro / verse /

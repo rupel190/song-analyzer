@@ -1,5 +1,5 @@
 <script lang="ts">
-  import SongAnalyzer from './lib/SongAnalyzer.svelte';
+  import SongMap from './lib/SongMap.svelte';
 </script>
 
-<SongAnalyzer />
+<SongMap />

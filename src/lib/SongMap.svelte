@@ -52,7 +52,8 @@
   const LANE_H = 46;
   const LANE_GAP = 6;
   const beatsPerBar = 4;
-  const MARKER_LABEL_H = 18; // a marker is only "hit" within its top label band
+  const MARKER_LABEL_H = 16; // marker label box height (only this band grabs a marker)
+  const MARKER_ROW_DY = 18; // vertical pitch between staggered label rows
   const DEFAULT_BLOCK_BARS = 4; // length of a block created by tapping a lane
 
   let laneIdCounter = 1;
@@ -75,6 +76,7 @@
   let markers = $state<Marker[]>([]);
   let playing = $state(false);
   let position = $state(0);
+  let volume = $state(1); // 0–1 output gain (playback only; not part of the map)
   let activeSection = $state<Section | null>(null);
   let loading = $state(false);
   let copied = $state(false);
@@ -94,6 +96,7 @@
   let audioCtx: AudioContext | null = null;
   let buffer: AudioBuffer | null = null;
   let source: AudioBufferSourceNode | null = null;
+  let gainNode: GainNode | null = null; // sits between source and destination
   let startedAt = 0; // ctx time when playback began
   let startOffset = 0; // buffer offset when playback began
   let raf = 0;
@@ -156,6 +159,24 @@
     const m = selectedMarker;
     if (!m || !duration) return null;
     return { centerX: (m.t / duration) * plotWidth, top: 22 };
+  });
+  // Assign each marker (in time order) to label row 0 or 1 so close labels don't
+  // overlap — greedy: reuse a row whose previous label has already ended. Shared
+  // by draw() and markerAt() so the hit-boxes always match what's painted.
+  const markerRows = $derived.by(() => {
+    const rows = new Map<number, number>();
+    if (!duration) return rows;
+    const rowRight = [-Infinity, -Infinity];
+    for (const m of markers) {
+      const x = (m.t / duration) * plotWidth;
+      const w = markerLabelWidth(m.name);
+      let row = 0;
+      if (x < rowRight[0] && x < rowRight[1]) row = rowRight[0] <= rowRight[1] ? 0 : 1;
+      else if (x < rowRight[0]) row = 1;
+      rowRight[row] = x + w;
+      rows.set(m.id, row);
+    }
+    return rows;
   });
 
   // Hoisted so the derived values above can reference them.
@@ -280,7 +301,12 @@
     if (audioCtx.state === 'suspended') audioCtx.resume();
     const src = audioCtx.createBufferSource();
     src.buffer = buffer;
-    src.connect(audioCtx.destination);
+    if (!gainNode) {
+      gainNode = audioCtx.createGain();
+      gainNode.connect(audioCtx.destination);
+    }
+    gainNode.gain.value = volume;
+    src.connect(gainNode);
     src.start(0, Math.max(0, offset));
     src.onended = () => {
       if (source === src) playing = false;
@@ -345,12 +371,15 @@
     ctx.font = '11px ui-sans-serif, system-ui';
     return ctx.measureText(name).width + 10;
   }
-  // Only the top label box grabs a marker — taps elsewhere on the line seek instead.
+  // Only a label box grabs a marker — taps elsewhere on the line seek instead.
+  // Labels are staggered across two rows (see markerRows), so check each marker's row.
   function markerAt(px: number, py: number): number | null {
-    if (!duration || py < 0 || py > MARKER_LABEL_H) return null;
+    if (!duration || py < 0 || py > MARKER_ROW_DY + MARKER_LABEL_H) return null;
     for (const m of markers) {
       const x = (m.t / duration) * plotWidth;
-      if (px >= x - 2 && px <= x + markerLabelWidth(m.name)) return m.id;
+      const ly = (markerRows.get(m.id) ?? 0) * MARKER_ROW_DY;
+      if (py >= ly && py <= ly + MARKER_LABEL_H + 2 && px >= x - 2 && px <= x + markerLabelWidth(m.name))
+        return m.id;
     }
     return null;
   }
@@ -391,6 +420,8 @@
     const mk = markerAt(px, py);
     if (mk != null) {
       selectMarker(mk);
+      const m = markers.find((x) => x.id === mk);
+      if (m) seekTo(m.t); // jump the playhead to the section you tapped
       return;
     }
     const t = timeAtX(e.clientX);
@@ -570,7 +601,6 @@
   function deleteMarker(id: number) {
     markers = markers.filter((x) => x.id !== id);
   }
-  const jumpTo = (t: number) => seekTo(t);
 
   // ── TSV export ─────────────────────────────────────────────────────────────────
   function exportTSV() {
@@ -784,6 +814,10 @@
   function onBpmInput(e: Event) {
     bpm = Math.min(300, Math.max(40, +(e.target as HTMLInputElement).value || 0));
   }
+  function onVolInput(e: Event) {
+    volume = clamp(+(e.target as HTMLInputElement).value, 0, 1);
+    if (gainNode) gainNode.gain.value = volume; // live while playing
+  }
   const nudgeFirstBeat = (d: number) => (firstBeat = Math.max(0, +(firstBeat + d).toFixed(3)));
   function tapTempo() {
     const now = performance.now();
@@ -936,9 +970,11 @@
       });
     }
 
-    // markers
+    // markers — labels staggered onto two rows (markerRows) so close ones don't overlap
+    ctx.font = '11px ui-sans-serif, system-ui';
     markers.forEach((m) => {
       const x = tx(m.t);
+      const ly = (markerRows.get(m.id) ?? 0) * MARKER_ROW_DY;
       const isSel = m.id === selectedMarkerId;
       ctx.save();
       ctx.strokeStyle = isSel ? '#f0e9d8' : m.color;
@@ -953,16 +989,15 @@
         ctx.lineTo(x, cssH);
         ctx.stroke();
       }
-      ctx.font = '11px ui-sans-serif, system-ui';
       const w = ctx.measureText(m.name).width + 10;
       ctx.fillStyle = m.color;
-      ctx.fillRect(x, 0, w, 16);
+      ctx.fillRect(x, ly, w, MARKER_LABEL_H);
       ctx.fillStyle = '#0d0c10';
-      ctx.fillText(m.name, x + 5, 12);
+      ctx.fillText(m.name, x + 5, ly + 12);
       if (isSel) {
         ctx.strokeStyle = '#f0e9d8';
         ctx.lineWidth = 1.5;
-        ctx.strokeRect(x + 0.5, 0.5, w, 16);
+        ctx.strokeRect(x + 0.5, ly + 0.5, w, MARKER_LABEL_H);
       }
       ctx.restore();
     });
@@ -990,59 +1025,71 @@
   <header class="topbar">
     <div class="topbar-row">
       <div class="titleblock">
-        <div class="kicker">SECTION MAP</div>
+        <div class="kicker">SONG MAP</div>
         <h1 class="title">{fileName || 'Load a track to begin'}</h1>
       </div>
-      <label class="loadBtn">
-        {loading ? 'Decoding…' : fileName ? 'Replace' : 'Load audio'}
-        <input type="file" accept="audio/*" onchange={handleFile} style="display:none" />
-      </label>
-    </div>
-    <div class="toolbar">
-      <div class="tgroup">
-        <button class="skipBtn" onclick={() => skipBars(-1)} disabled={!peaks} title="Back one bar" aria-label="Back one bar">«bar</button>
-        <button class="playBtn" onclick={togglePlay} disabled={!peaks}>{playing ? '❚❚' : '▶'}</button>
-        <button class="skipBtn" onclick={() => skipBars(1)} disabled={!peaks} title="Forward one bar" aria-label="Forward one bar">bar»</button>
-        <div class="timeReadout">
-          <span class="timeNow">{fmtTime(position)}</span>
-          <span class="timeTotal">/ {fmtTime(duration)}</span>
-        </div>
-        <div class="barReadout">bar <strong style="color:#d4915d">{currentBar > 0 ? currentBar : '–'}</strong></div>
-      </div>
-      <div class="tgroup">
+      <div class="fileActions">
         <button class="exportBtn" onclick={importTSV} disabled={!peaks}>Import TSV</button>
         <button class="exportBtn" onclick={exportTSV} disabled={!showFooter}>{copied ? 'Copied ✓' : 'Copy TSV'}</button>
         <button class="clearAll" class:armed={confirmClear} onclick={clearAll} disabled={!showFooter}>
           {confirmClear ? 'Confirm?' : 'Clear all'}
         </button>
+        <label class="loadBtn">
+          {loading ? 'Decoding…' : fileName ? 'Replace' : 'Load audio'}
+          <input type="file" accept="audio/*" onchange={handleFile} style="display:none" />
+        </label>
       </div>
     </div>
   </header>
 
-  <!-- BPM / grid controls -->
-  <div class="gridPanel">
-    <div class="gridControl">
-      <label class="lbl" for="bpm-input">BPM</label>
-      <div class="stepperRow">
-        <button class="step" onclick={() => (bpm = Math.max(40, bpm - 1))}>−</button>
-        <input id="bpm-input" class="numInput" type="number" value={bpm} oninput={onBpmInput} />
-        <button class="step" onclick={() => (bpm = Math.min(300, bpm + 1))}>+</button>
+  <!-- Transport + grid controls (one combined panel) -->
+  <div class="controls">
+    <div class="cgroup">
+      <button class="skipBtn" onclick={() => skipBars(-1)} disabled={!peaks} title="Back one bar" aria-label="Back one bar">«bar</button>
+      <button class="playBtn" onclick={togglePlay} disabled={!peaks}>{playing ? '❚❚' : '▶'}</button>
+      <button class="skipBtn" onclick={() => skipBars(1)} disabled={!peaks} title="Forward one bar" aria-label="Forward one bar">bar»</button>
+      <div class="timeReadout">
+        <span class="timeNow">{fmtTime(position)}</span>
+        <span class="timeTotal">/ {fmtTime(duration)}</span>
       </div>
+      <div class="barReadout">bar <strong style="color:#d4915d">{currentBar > 0 ? currentBar : '–'}</strong></div>
     </div>
-    <button class="tapBtn" onclick={tapTempo}>TAP</button>
-    <div class="gridControl">
-      <span class="lbl">Bar 1 offset</span>
-      <div class="stepperRow">
-        <button class="step" onclick={() => nudgeFirstBeat(-0.05)}>−</button>
-        <span class="offsetVal">{firstBeat.toFixed(2)}s</span>
-        <button class="step" onclick={() => nudgeFirstBeat(0.05)}>+</button>
+    <div class="cgroup volGroup">
+      <span class="lbl">Vol</span>
+      <input
+        class="volSlider"
+        type="range"
+        min="0"
+        max="1"
+        step="0.01"
+        value={volume}
+        oninput={onVolInput}
+        disabled={!peaks}
+        aria-label="Volume"
+      />
+    </div>
+    <div class="cgroup">
+      <div class="gridControl">
+        <label class="lbl" for="bpm-input">BPM</label>
+        <div class="stepperRow">
+          <button class="step" onclick={() => (bpm = Math.max(40, bpm - 1))}>−</button>
+          <input id="bpm-input" class="numInput" type="number" value={bpm} oninput={onBpmInput} />
+          <button class="step" onclick={() => (bpm = Math.min(300, bpm + 1))}>+</button>
+        </div>
       </div>
+      <button class="tapBtn" onclick={tapTempo}>TAP</button>
+      <div class="gridControl">
+        <span class="lbl">Bar 1 offset</span>
+        <div class="stepperRow">
+          <button class="step" onclick={() => nudgeFirstBeat(-0.05)}>−</button>
+          <span class="offsetVal">{firstBeat.toFixed(2)}s</span>
+          <button class="step" onclick={() => nudgeFirstBeat(0.05)}>+</button>
+        </div>
+      </div>
+      <button class="toggle" class:on={showGrid} onclick={() => (showGrid = !showGrid)}>
+        Grid {showGrid ? 'on' : 'off'}
+      </button>
     </div>
-    <button class="toggle" class:on={showGrid} onclick={() => (showGrid = !showGrid)}>
-      Grid {showGrid ? 'on' : 'off'}
-    </button>
-    <button class="alignBtn" onclick={() => (firstBeat = +position.toFixed(3))} disabled={!peaks}
-      title="Set the current playhead as the downbeat of bar 1">Set bar 1 = playhead</button>
   </div>
 
   <!-- Section palette -->
@@ -1192,29 +1239,6 @@
     </div>
     <div class="hint">Tap an empty lane to add a block · tap a block to edit it.</div>
   {/if}
-
-  <!-- Marker list -->
-  <div class="listHead">
-    <span>Markers</span>
-    <span class="count">{markers.length}</span>
-  </div>
-  {#if markers.length === 0}
-    <div class="empty">No markers yet. Play the track and tap a section as each part begins.</div>
-  {:else}
-    <ul class="list">
-      {#each markers as m (m.id)}
-        <li class="listItem">
-          <span class="dot" style="background:{m.color}"></span>
-          <button class="jump" onclick={() => jumpTo(m.t)}>
-            <strong style="color:#e8e4da">{m.name}</strong>
-            <span class="itemTime">{fmtTime(m.t)} · bar {barAtTime(m.t)}</span>
-          </button>
-          <button class="iconBtn" onclick={() => selectMarker(m.id)} title="Edit">✎</button>
-          <button class="iconBtn" onclick={() => { deleteMarker(m.id); if (selectedMarkerId === m.id) deselect(); }} title="Delete">✕</button>
-        </li>
-      {/each}
-    </ul>
-  {/if}
 </div>
 
 <style>
@@ -1246,21 +1270,37 @@
   .titleblock {
     min-width: 0;
   }
-  .toolbar {
+  .fileActions {
     display: flex;
     flex-wrap: wrap;
-    justify-content: space-between;
     align-items: center;
-    gap: 10px 14px;
-    padding: 8px 12px;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 18px;
+    margin: 16px 0;
+    padding: 10px 14px;
     background: #131218;
     border: 1px solid #1f1d28;
     border-radius: 10px;
   }
-  .tgroup {
+  .cgroup {
     display: flex;
     align-items: center;
     gap: 12px;
+  }
+  .volGroup {
+    gap: 8px;
+  }
+  .volSlider {
+    width: 96px;
+    accent-color: #4a8fb8;
+    cursor: pointer;
   }
   .kicker {
     font-family: var(--mono);
@@ -1290,17 +1330,6 @@
     align-self: center;
   }
 
-  .gridPanel {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    gap: 10px;
-    margin: 18px 0;
-    padding: 14px;
-    background: #131218;
-    border-radius: 10px;
-    border: 1px solid #1f1d28;
-  }
   .gridControl {
     display: flex;
     flex-direction: column;
@@ -1374,17 +1403,6 @@
     border-color: #4a8fb8;
     color: #4a8fb8;
   }
-  .alignBtn {
-    height: 32px;
-    padding: 0 12px;
-    border-radius: 6px;
-    border: 1px solid #2c2a38;
-    background: #1c1b22;
-    color: #a8a3bd;
-    font-size: 12px;
-    cursor: pointer;
-  }
-
   .sectionRow {
     display: flex;
     flex-wrap: wrap;
@@ -1604,9 +1622,6 @@
     margin-bottom: 4px;
     margin-top: 22px;
   }
-  .count {
-    color: #d4915d;
-  }
   .addLaneBtn {
     background: #1c1b22;
     border: 1px solid #3a3850;
@@ -1674,56 +1689,6 @@
     padding: 0 2px;
   }
 
-  .empty {
-    font-size: 13px;
-    color: #8e89a3;
-    padding: 16px 4px;
-  }
-  .list {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-  .listItem {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 4px;
-    border-bottom: 1px solid #161520;
-  }
-  .dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-  .jump {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    background: none;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    padding: 0;
-    font-family: var(--sans);
-  }
-  .itemTime {
-    font-size: 11.5px;
-    color: #8e89a3;
-    font-family: var(--mono);
-  }
-  .iconBtn {
-    width: 34px;
-    height: 34px;
-    border-radius: 6px;
-    border: 1px solid #262433;
-    background: transparent;
-    color: #a8a3bd;
-    cursor: pointer;
-    font-size: 13px;
-  }
   .exportBtn {
     background: #1c1b22;
     border: 1px solid #3a3850;
