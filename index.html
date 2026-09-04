@@ -3,7 +3,59 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Song Map</title>
+    <title>Song Map — map a track's structure, sections and arrangement</title>
+    <meta
+      name="description"
+      content="Load an audio file and map how the track is built: waveform, BPM bar-grid, colour-coded section markers (intro / verse / chorus / drop) and instrument arrangement lanes. Runs entirely in the browser — nothing is uploaded."
+    />
+    <meta name="author" content="Christoph Rippel" />
+
+    <!--
+      Two hostnames serve this same deployment (songmap. and songanalyzer.), which would
+      otherwise compete as duplicates. songmap is the canonical one: it matches the product
+      name, and it is what rupel.xyz and the repo link to. songanalyzer keeps working and
+      defers here.
+    -->
+    <link rel="canonical" href="https://songmap.rupel.xyz/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://songmap.rupel.xyz/" />
+    <meta property="og:site_name" content="Song Map" />
+    <meta property="og:title" content="Song Map — map a track's structure, sections and arrangement" />
+    <meta
+      property="og:description"
+      content="Waveform, BPM bar-grid, section markers and arrangement lanes. Entirely client-side — your audio never leaves the browser."
+    />
+    <meta property="og:image" content="https://songmap.rupel.xyz/og-image.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Song Map — map a track's structure, sections and arrangement" />
+    <meta
+      name="twitter:description"
+      content="Waveform, BPM bar-grid, section markers and arrangement lanes. Entirely client-side — your audio never leaves the browser."
+    />
+    <meta name="twitter:image" content="https://songmap.rupel.xyz/og-image.jpg" />
+
+    <meta name="theme-color" content="#0d0c10" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "Song Map",
+        "url": "https://songmap.rupel.xyz/",
+        "description": "A client-side tool for mapping the structure of a track: waveform, BPM bar-grid, section markers and instrument arrangement lanes.",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "Any (web browser)",
+        "browserRequirements": "Requires JavaScript and the Web Audio API",
+        "author": { "@type": "Person", "name": "Christoph Rippel", "url": "https://rupel.xyz" },
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" },
+        "isAccessibleForFree": true
+      }
+    </script>
+
     <style>
       html,
       body {
