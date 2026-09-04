@@ -11,22 +11,21 @@
     <meta name="author" content="Christoph Rippel" />
 
     <!--
-      Two hostnames serve this same deployment (songmap. and songanalyzer.), which would
-      otherwise compete as duplicates. songmap is the canonical one: it matches the product
-      name, and it is what rupel.xyz and the repo link to. songanalyzer keeps working and
-      defers here.
+      Lives at rupel.xyz/songmap, not on a subdomain: a subdomain accumulates its own
+      authority instead of feeding rupel.xyz, and there was nothing to lose by moving.
+      See vite.config.ts for the matching `base`.
     -->
-    <link rel="canonical" href="https://songmap.rupel.xyz/" />
+    <link rel="canonical" href="https://rupel.xyz/songmap/" />
 
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://songmap.rupel.xyz/" />
+    <meta property="og:url" content="https://rupel.xyz/songmap/" />
     <meta property="og:site_name" content="Song Map" />
     <meta property="og:title" content="Song Map — map a track's structure, sections and arrangement" />
     <meta
       property="og:description"
       content="Waveform, BPM bar-grid, section markers and arrangement lanes. Entirely client-side — your audio never leaves the browser."
     />
-    <meta property="og:image" content="https://songmap.rupel.xyz/og-image.jpg" />
+    <meta property="og:image" content="https://rupel.xyz/songmap/og-image.jpg" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
 
@@ -36,7 +35,7 @@
       name="twitter:description"
       content="Waveform, BPM bar-grid, section markers and arrangement lanes. Entirely client-side — your audio never leaves the browser."
     />
-    <meta name="twitter:image" content="https://songmap.rupel.xyz/og-image.jpg" />
+    <meta name="twitter:image" content="https://rupel.xyz/songmap/og-image.jpg" />
 
     <meta name="theme-color" content="#0d0c10" />
 
@@ -45,7 +44,7 @@
         "@context": "https://schema.org",
         "@type": "WebApplication",
         "name": "Song Map",
-        "url": "https://songmap.rupel.xyz/",
+        "url": "https://rupel.xyz/songmap/",
         "description": "A client-side tool for mapping the structure of a track: waveform, BPM bar-grid, section markers and instrument arrangement lanes.",
         "applicationCategory": "MultimediaApplication",
         "operatingSystem": "Any (web browser)",
