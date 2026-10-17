@@ -1,8 +1,8 @@
 {
   // Static-assets Worker: serves the Vite build output in ./dist.
   // The CI deploy command (`npx wrangler deploy`) needs this to know what to ship.
-  // Name must match the existing Worker so the deploy updates it (and keeps the
-  // song-analyzer.rupel.xyz custom domain attached).
+  // Name must match the existing Worker so the deploy updates it. It is served ONLY at
+  // rupel.xyz/songmap/ (a zone route; the old subdomains were removed 2026-10-17).
   "name": "song-analyzer",
   // Only the custom domains serve the site: no *.workers.dev name, no per-version preview URLs.
   "workers_dev": false,
