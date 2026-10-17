@@ -4,6 +4,9 @@
   // Name must match the existing Worker so the deploy updates it (and keeps the
   // song-analyzer.rupel.xyz custom domain attached).
   "name": "song-analyzer",
+  // Only the custom domains serve the site: no *.workers.dev name, no per-version preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
   "compatibility_date": "2025-06-18",
   "assets": {
     "directory": "./dist"
